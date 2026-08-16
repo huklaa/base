@@ -247,6 +247,7 @@ skip = [
     "alloy-json-rpc",
     "alloy-network",
     "alloy-network-primitives",
+    "alloy-node-bindings",
     "alloy-provider",
     "alloy-rpc-client",
     "alloy-rpc-types",
