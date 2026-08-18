@@ -22,8 +22,8 @@ use base_execution_payload_builder::{
     BasePayloadBuilderAttributes, error::BasePayloadBuilderError,
 };
 use base_execution_txpool::{
-    BasePooledTx, BundleTransaction, GuardMetrics, PredicateContext, TimestampedTransaction,
-    ValidityPredicate, estimated_da_size::DataAvailabilitySized,
+    BasePooledTx, GuardMetrics, PredicateContext, TimestampedTransaction, ValidityPredicate,
+    estimated_da_size::DataAvailabilitySized,
 };
 use base_observability_events::TransactionEventType;
 use reth_basic_payload_builder::PayloadConfig;
@@ -771,94 +771,6 @@ impl BasePayloadBuilderCtx {
         let mut predicate_eval_total: Option<Duration> = None;
 
         while let Some(tx) = best_txs.next(()) {
-            if tx.is_bundle_expired(block_number, block_timestamp) {
-                let tx_hash = *tx.hash();
-                let min_block_number = tx.min_block_number();
-                let max_block_number = tx.max_block_number();
-                num_txs_considered += 1;
-                let ordering_position = num_txs_considered;
-                trace!(
-                    target: "payload_builder",
-                    tx_hash = ?tx_hash,
-                    block = block_number,
-                    timestamp = block_timestamp,
-                    "skipping bundle tx: expired"
-                );
-                self.emit_builder_decision_event(
-                    &payload_id,
-                    TransactionEventType::BuilderConsidered,
-                    tx_hash,
-                    Some(ordering_position),
-                    || {
-                        BuilderConsideredEventData::new(info, limits, None)
-                            .with_bundle_block_window(min_block_number, max_block_number)
-                    },
-                );
-                self.emit_builder_decision_event(
-                    &payload_id,
-                    TransactionEventType::BuilderExpired,
-                    tx_hash,
-                    Some(ordering_position),
-                    || {
-                        BuilderExpiredEventData::new(
-                            "bundle_expired",
-                            "bundle validity window expired",
-                            info,
-                            limits,
-                            None,
-                        )
-                    },
-                );
-                best_txs.mark_invalid(tx.sender(), tx.nonce());
-                continue;
-            }
-
-            if tx.is_bundle_not_yet_valid(block_number, block_timestamp) {
-                let tx_hash = *tx.hash();
-                let min_block_number = tx.min_block_number();
-                let max_block_number = tx.max_block_number();
-                num_txs_considered += 1;
-                let ordering_position = num_txs_considered;
-                trace!(
-                    target: "payload_builder",
-                    tx_hash = ?tx_hash,
-                    block = block_number,
-                    timestamp = block_timestamp,
-                    "skipping bundle tx: not yet valid"
-                );
-                self.emit_builder_decision_event(
-                    &payload_id,
-                    TransactionEventType::BuilderConsidered,
-                    tx_hash,
-                    Some(ordering_position),
-                    || {
-                        BuilderConsideredEventData::new(info, limits, None)
-                            .with_bundle_block_window(min_block_number, max_block_number)
-                    },
-                );
-                self.emit_builder_decision_event(
-                    &payload_id,
-                    TransactionEventType::BuilderRejected,
-                    tx_hash,
-                    Some(ordering_position),
-                    || {
-                        BuilderRejectedEventData::new(
-                            "bundle_not_yet_valid",
-                            "bundle validity window has not started",
-                            false,
-                            info,
-                            limits,
-                            None,
-                        )
-                        .with_bundle_block_window(min_block_number, max_block_number)
-                        .with_current_block(block_number)
-                        .with_block_timestamp(block_timestamp)
-                    },
-                );
-                best_txs.mark_invalid(tx.sender(), tx.nonce());
-                continue;
-            }
-
             let tx_hash = *tx.hash();
             let has_validity_predicates = !tx.validity_predicates().is_empty();
 

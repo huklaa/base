@@ -3351,19 +3351,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "base-bundle-extension"
-version = "0.0.0"
-dependencies = [
- "base-execution-txpool",
- "base-node-runner",
- "reth-chain-state",
- "reth-provider",
- "tokio",
- "tokio-stream",
- "tracing",
-]
-
-[[package]]
 name = "base-bundles"
 version = "0.0.0"
 dependencies = [
@@ -4159,7 +4146,6 @@ dependencies = [
  "alloy-primitives",
  "axum 0.8.9",
  "backon",
- "base-bundle-extension",
  "base-cli-utils",
  "base-common-chains",
  "base-common-consensus",
@@ -6141,7 +6127,6 @@ dependencies = [
  "base-batcher-encoder",
  "base-batcher-service",
  "base-builder-core",
- "base-bundle-extension",
  "base-common-consensus",
  "base-common-genesis",
  "base-common-network",
