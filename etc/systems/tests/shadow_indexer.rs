@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use base_node_runner::FromExtensionConfig;
-use base_shadow_indexer::{ShadowIndexerConfig, ShadowIndexerExtension};
+use base_shadow_indexer::{ShadowIndexerConfig, ShadowIndexerExtension, ShadowRetentionConfig};
 use base_shadow_indexer_db::{ShadowBlockRepo, ShadowDbConfig};
 use base_system_tests::{SystemTestProviderExt, SystemTestStackBuilder};
 use eyre::{Result, WrapErr, ensure};
@@ -16,6 +16,9 @@ const L2_CHAIN_ID: u64 = 84538453;
 const BLOCK_PRODUCTION_TIMEOUT: Duration = Duration::from_secs(60);
 const DB_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const DB_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Long enough that no block this test produces can expire while it runs.
+const RETENTION_PERIOD: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[tokio::test]
 async fn shadow_indexer_persists_committed_blocks() -> Result<()> {
@@ -32,6 +35,7 @@ async fn shadow_indexer_persists_committed_blocks() -> Result<()> {
         enabled: true,
         db: db_config.clone(),
         builder_version: "e2e-test".to_string(),
+        retention: ShadowRetentionConfig { period: RETENTION_PERIOD, interval: RETENTION_INTERVAL },
     }));
 
     let system = SystemTestStackBuilder::new()

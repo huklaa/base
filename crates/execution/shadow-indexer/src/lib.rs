@@ -6,5 +6,8 @@ pub use extension::{ShadowIndexerConfig, ShadowIndexerExtension};
 mod exex;
 pub use exex::ShadowIndexerExEx;
 
+mod retention;
+pub use retention::{ShadowRetention, ShadowRetentionConfig};
+
 mod writer;
 pub use writer::ShadowWriter;
