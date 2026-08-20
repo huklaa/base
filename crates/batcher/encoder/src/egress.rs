@@ -7,7 +7,7 @@ use std::{
 
 use base_protocol::{BLOB_DERIVATION_PREFIX_SIZE, BLOB_MAX_DATA_SIZE, ChannelId, Frame};
 
-use crate::{BatchSubmission, BlobPayload, DaType, SubmissionId, record::Channel};
+use crate::{BatchSubmission, BlobPayload, ChannelRecord, DaType, SubmissionId};
 
 /// Stable identifier for one immutable DA artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,7 +532,7 @@ mod tests {
     use base_protocol::SingleBatch;
 
     use super::*;
-    use crate::{CompressionAlgo, EncoderConfig, record::ChannelAddOutcome};
+    use crate::{ChannelAddOutcome, CompressionAlgo, EncoderConfig};
 
     fn channel(id: ChannelId, opened_l1_block: u64, duration: u64) -> Channel {
         let config = EncoderConfig {

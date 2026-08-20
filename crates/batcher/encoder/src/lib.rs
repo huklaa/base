@@ -7,27 +7,29 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+pub use base_comp::{CompressionAlgo, CompressionError};
+
 mod submission;
 pub use submission::{
     BatchSubmission, BlobPayload, DaType, FrameEncoder, SubmissionId, SubmissionPayload,
 };
 
 mod config;
-pub use config::{CompressionAlgo, EncoderConfig, EncoderConfigError};
+pub use config::{EncoderConfig, EncoderConfigError};
 
-mod pipeline;
-pub use pipeline::{BatchPipeline, DerivationReconciliation, ReorgError, StepError, StepResult};
+mod composer;
+pub use composer::{BatchComposeError, BatchComposer};
 
 mod channel;
 pub use channel::{
-    ChannelAddOutcome, ChannelFullReason, FrameState, OpenChannel, OpenChannelError, PendingRef,
-    ReadyChannel,
+    ChannelAddOutcome, ChannelCloseReason, ChannelError, ChannelLimit, ChannelRecord,
 };
 
-#[allow(dead_code, unreachable_pub, unnameable_types)]
 mod egress;
-#[allow(dead_code, unreachable_pub, unnameable_types)]
-mod record;
+pub use egress::{ArtifactId, ArtifactState, DaArtifact, DaArtifactPayload, DaEgress};
+
+mod pipeline;
+pub use pipeline::{BatchPipeline, DerivationReconciliation, ReorgError, StepError, StepResult};
 
 mod encoder;
 pub use encoder::BatchEncoder;
