@@ -3074,6 +3074,7 @@ dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
  "alloy-primitives",
+ "alloy-rlp",
  "base-common-consensus",
  "base-common-genesis",
  "base-comp",
