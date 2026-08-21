@@ -7,7 +7,7 @@ use std::{
 
 use base_protocol::{BLOB_DERIVATION_PREFIX_SIZE, BLOB_MAX_DATA_SIZE, ChannelId, Frame};
 
-use crate::{BatchSubmission, BlobPayload, ChannelRecord, DaType, SubmissionId};
+use crate::{BatchSubmission, BlobPayload, Channel, DaType, SubmissionId};
 
 /// Stable identifier for one immutable DA artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
