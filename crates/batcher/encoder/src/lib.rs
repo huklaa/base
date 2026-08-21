@@ -21,9 +21,7 @@ mod composer;
 pub use composer::{BatchComposeError, BatchComposer};
 
 mod channel;
-pub use channel::{
-    Channel, ChannelAddOutcome, ChannelCloseReason, ChannelError, ChannelLimit,
-};
+pub use channel::{Channel, ChannelAddOutcome, ChannelCloseReason, ChannelError, ChannelLimit};
 
 mod egress;
 pub use egress::{ArtifactId, ArtifactState, DaArtifact, DaArtifactPayload, DaEgress};
