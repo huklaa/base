@@ -110,29 +110,29 @@ impl ShadowMetricsReader {
 
         for row in rows {
             let cursor = row.cursor();
-            match row.canonical_hash.as_ref() {
-                None => ShadowMetrics::reverted_blocks_total().increment(1),
-                Some(_) => {
-                    let stats = ShadowBlockStats::from_row(&row);
-                    ShadowMetrics::gas_used(stats.builder_version.clone())
-                        .record(stats.gas_used as f64);
-                    ShadowMetrics::transaction_count(stats.builder_version.clone())
-                        .record(stats.transaction_count as f64);
-                    ShadowMetrics::priority_fee_inversions(stats.builder_version.clone())
-                        .record(stats.priority_fee_inversions as f64);
-                    ShadowMetrics::blocks_inspected_total().increment(1);
-                    if stats.non_deposit_tx_count == 0 {
-                        ShadowMetrics::empty_blocks_total().increment(1);
-                    }
-
-                    if self.latest_block_number.is_none_or(|latest| stats.number > latest) {
-                        self.latest_block_number = Some(stats.number);
-                        ShadowMetrics::latest_block_number().set(stats.number as f64);
-                    }
-                    emitted.push(stats);
+            // A row without a canonical hash is unresolved, not empty: its replacement has not
+            // been produced yet. Resolving it bumps `updated_at`, bringing it back past this
+            // cursor to be classified then.
+            if row.canonical_hash.is_some() {
+                let stats = ShadowBlockStats::from_row(&row);
+                ShadowMetrics::gas_used(stats.builder_version.clone())
+                    .record(stats.gas_used as f64);
+                ShadowMetrics::transaction_count(stats.builder_version.clone())
+                    .record(stats.transaction_count as f64);
+                ShadowMetrics::priority_fee_inversions(stats.builder_version.clone())
+                    .record(stats.priority_fee_inversions as f64);
+                ShadowMetrics::blocks_inspected_total().increment(1);
+                if stats.non_deposit_tx_count == 0 {
+                    ShadowMetrics::empty_blocks_total().increment(1);
                 }
+
+                if self.latest_block_number.is_none_or(|latest| stats.number > latest) {
+                    self.latest_block_number = Some(stats.number);
+                    ShadowMetrics::latest_block_number().set(stats.number as f64);
+                }
+                emitted.push(stats);
             }
-            // Every fetched row advances the cursor, including unwinds.
+            // Every fetched row advances the cursor, including unresolved ones.
             next_cursor = cursor;
         }
 

@@ -2,9 +2,18 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, QueryBuilder, query_as, types::Json};
+use sqlx::{PgPool, Postgres, QueryBuilder, query, query_as, types::Json};
 
-use crate::{ShadowBlockCursor, ShadowBlockRow};
+use crate::{ShadowBlockCursor, ShadowBlockRow, ShadowCanonicalRef};
+
+/// Rows written and rows resolved by a single flush.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShadowFlushOutcome {
+    /// Rows inserted or updated.
+    pub rows_written: usize,
+    /// Rows that gained a canonical hash.
+    pub rows_reconciled: usize,
+}
 
 /// Shadow block repository.
 #[derive(Debug)]
@@ -19,22 +28,29 @@ impl ShadowBlockRepo {
         Self { pool }
     }
 
-    /// Inserts shadow block rows.
+    /// Persists reorged rows and resolves stored rows from canonical blocks.
+    ///
+    /// Both run in one transaction, so a reader cannot observe a row written unresolved in the
+    /// same flush that resolves it.
     ///
     /// # Errors
-    /// Returns an error when the insert fails.
-    pub async fn insert_batch(&self, rows: &[ShadowBlockRow]) -> Result<usize> {
+    /// Returns an error when the transaction fails.
+    pub async fn flush(
+        &self,
+        rows: &[ShadowBlockRow],
+        canonical: &[ShadowCanonicalRef],
+    ) -> Result<ShadowFlushOutcome> {
         // Six binds per row; 4,000 stays below Postgres's 65,535-parameter limit.
         const CHUNK_SIZE: usize = 4_000;
 
-        if rows.is_empty() {
-            return Ok(0);
+        if rows.is_empty() && canonical.is_empty() {
+            return Ok(ShadowFlushOutcome::default());
         }
 
-        // Postgres cannot upsert one key twice; retain its final state within each flush.
         let deduped = Self::dedupe_last_write_wins(rows);
 
-        let mut inserted = 0usize;
+        let mut tx = self.pool.begin().await.context("failed to begin shadow block transaction")?;
+        let mut rows_written = 0usize;
 
         for chunk in deduped.chunks(CHUNK_SIZE) {
             let mut query_builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
@@ -51,24 +67,72 @@ impl ShadowBlockRepo {
                     .push_bind(Json(&entry.payload));
             });
 
+            // `COALESCE` makes `canonical_hash` monotonic. A redelivered notification carries
+            // `NULL` and must not erase a hash the backfill already established.
             query_builder.push(
                 " ON CONFLICT (number, hash) DO UPDATE SET \
                  reorged_out = EXCLUDED.reorged_out, \
-                 canonical_hash = EXCLUDED.canonical_hash, \
+                 canonical_hash = \
+                   COALESCE(EXCLUDED.canonical_hash, shadow_blocks.canonical_hash), \
                  payload = EXCLUDED.payload, \
                  updated_at = now()",
             );
 
             let result = query_builder
                 .build()
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .context("failed to insert shadow block batch")?;
 
-            inserted = inserted.saturating_add(result.rows_affected() as usize);
+            rows_written = rows_written.saturating_add(result.rows_affected() as usize);
         }
 
-        Ok(inserted)
+        let rows_reconciled = Self::resolve_canonical_hashes(&mut tx, canonical).await?;
+
+        tx.commit().await.context("failed to commit shadow block transaction")?;
+
+        Ok(ShadowFlushOutcome { rows_written, rows_reconciled })
+    }
+
+    async fn resolve_canonical_hashes(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        canonical: &[ShadowCanonicalRef],
+    ) -> Result<usize> {
+        if canonical.is_empty() {
+            return Ok(0);
+        }
+
+        let (numbers, hashes) = Self::dedupe_canonical_last_write_wins(canonical);
+
+        let result = query(
+            "UPDATE shadow_blocks AS unresolved \
+             SET canonical_hash = canonical.hash, updated_at = now() \
+             FROM UNNEST($1::BIGINT[], $2::BYTEA[]) AS canonical(number, hash) \
+             WHERE unresolved.number = canonical.number \
+               AND unresolved.hash <> canonical.hash \
+               AND unresolved.reorged_out \
+               AND unresolved.canonical_hash IS NULL",
+        )
+        .bind(&numbers)
+        .bind(&hashes)
+        .execute(&mut **tx)
+        .await
+        .context("failed to resolve canonical hashes for shadow blocks")?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
+    /// Postgres picks an arbitrary source row when several `UNNEST` entries match one target, so
+    /// a height appearing twice in a flush must collapse to the last hash before binding.
+    fn dedupe_canonical_last_write_wins(
+        canonical: &[ShadowCanonicalRef],
+    ) -> (Vec<i64>, Vec<Vec<u8>>) {
+        let mut by_number: HashMap<i64, &[u8]> = HashMap::with_capacity(canonical.len());
+        for entry in canonical {
+            by_number.insert(entry.number, entry.hash.as_slice());
+        }
+
+        by_number.into_iter().map(|(number, hash)| (number, hash.to_vec())).unzip()
     }
 
     fn dedupe_last_write_wins(rows: &[ShadowBlockRow]) -> Vec<&ShadowBlockRow> {
@@ -98,7 +162,7 @@ impl ShadowBlockRepo {
 
     /// Lists reorged rows after a composite cursor.
     ///
-    /// Unwinds remain in the query so Rust can count them and advance past them.
+    /// Unresolved rows remain in the query so Rust can advance the cursor past them.
     ///
     /// # Errors
     /// Returns an error on query or payload decode failure.

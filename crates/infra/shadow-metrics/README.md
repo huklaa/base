@@ -6,11 +6,18 @@ Polling reader that turns persisted shadow blocks into Prometheus metrics.
 
 `ShadowMetricsReader` polls `shadow_blocks` for shadow candidate blocks that
 were reorged out and emits gas used, transaction count, priority fee
-inversions, empty blocks, reverted blocks, and the latest block number.
+inversions, empty blocks, and the latest block number.
 `ShadowMetricsStore` is the thin Postgres handle underneath it: it establishes
 an eager `PgPool` from a connection URL and exposes a schema-readiness check for
 Kubernetes-style `/readyz` probes. `base-shadow-indexer-db` owns and applies the
 shared schema.
+
+A row is emitted only once `canonical_hash` is set. A reorg records its
+displaced blocks before the chain has produced every replacement, so rows
+arrive unresolved; the reader advances past them and picks them up when the
+indexer fills the hash in, which bumps `updated_at`. A row that never gains a
+canonical hash is never emitted: nothing distinguishes it from one still
+awaiting its replacement.
 
 Emission happens before the cursor is persisted, making delivery at-least-once.
 `ShadowMetricsReader::run` never returns an error: database errors leave the

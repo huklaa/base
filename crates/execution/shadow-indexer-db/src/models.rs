@@ -14,7 +14,7 @@ pub struct ShadowBlockRow {
     pub hash: Vec<u8>,
     /// Whether block was reorged out.
     pub reorged_out: bool,
-    /// Replacement block hash after reorg.
+    /// Replacement block hash at this height, absent until that block is canonical.
     pub canonical_hash: Option<Vec<u8>>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
@@ -37,6 +37,15 @@ impl ShadowBlockRow {
             hash: self.hash.clone(),
         }
     }
+}
+
+/// Canonical block at a height, used to resolve rows the chain discarded there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShadowCanonicalRef {
+    /// Block number.
+    pub number: i64,
+    /// Raw block hash.
+    pub hash: Vec<u8>,
 }
 
 /// Shadow block JSONB payload.
