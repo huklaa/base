@@ -9,6 +9,7 @@ use crate::{
 
 base_cli_utils::define_log_args!("BASE_NODE");
 base_cli_utils::define_metrics_args!("BASE_NODE", 9090);
+base_cli_utils::define_telemetry_args!("BASE_NODE");
 
 /// The `base` CLI.
 #[derive(Parser, Debug)]
@@ -36,6 +37,10 @@ pub(crate) struct BaseCli {
     #[command(flatten)]
     pub(crate) metrics: MetricsArgs,
 
+    /// Telemetry configuration.
+    #[command(flatten)]
+    pub(crate) telemetry: TelemetryArgs,
+
     /// The command to run.
     #[command(subcommand)]
     pub(crate) command: BaseCommand,
@@ -55,7 +60,7 @@ impl BaseCli {
             })
             .wrap_err("failed to install Prometheus recorder")?;
 
-        self.command.run(ChainResolver::new(self.chain), metrics_enabled)
+        self.command.run(ChainResolver::new(self.chain), metrics_enabled, self.telemetry)
     }
 }
 
@@ -123,6 +128,43 @@ mod tests {
 
         let rendered = err.to_string();
         assert!(rendered.contains("cannot be used multiple times"));
+    }
+
+    #[test]
+    fn telemetry_is_opt_out_and_inert_without_an_endpoint() {
+        let cli = BaseCli::parse_from(["base", "bootnode"]);
+
+        assert!(cli.telemetry.enabled, "telemetry is opt-out, so it parses as enabled");
+        assert_eq!(cli.telemetry.endpoint, None, "no endpoint means the node reports nowhere");
+        assert!(!cli.telemetry.config(8453).is_active());
+    }
+
+    #[test]
+    fn parses_telemetry_endpoint_and_opt_out() {
+        let cli = BaseCli::parse_from([
+            "base",
+            "--telemetry.endpoint",
+            "http://127.0.0.1:8080/v1/ingest",
+            "--telemetry.enabled=false",
+            "bootnode",
+        ]);
+
+        assert_eq!(
+            cli.telemetry.endpoint.as_ref().map(url::Url::as_str),
+            Some("http://127.0.0.1:8080/v1/ingest")
+        );
+        assert!(
+            !cli.telemetry.config(8453).is_active(),
+            "opting out must win over a configured endpoint"
+        );
+    }
+
+    #[test]
+    fn telemetry_id_path_defaults_to_the_chain_directory() {
+        let cli = BaseCli::parse_from(["base", "bootnode"]);
+
+        let config = cli.telemetry.config(8453);
+        assert!(config.id_path.ends_with("8453/telemetry-id"), "got {}", config.id_path.display());
     }
 
     #[test]
