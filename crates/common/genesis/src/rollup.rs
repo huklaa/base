@@ -431,6 +431,34 @@ impl RollupConfig {
         self.l2_block_timestamp_millis(block_number).saturating_div(1_000)
     }
 
+    /// Returns the deterministic whole-second timestamp of an L2 block.
+    ///
+    /// Returns [`None`] if the block precedes L2 genesis, the block time is zero, or the canonical
+    /// timestamp cannot be represented as a [`u64`].
+    pub fn checked_l2_block_timestamp(&self, block_number: u64) -> Option<u64> {
+        if self.block_time == 0 {
+            return None;
+        }
+
+        let blocks_since_genesis = block_number.checked_sub(self.genesis.l2.number)?;
+        let denim_activation_block = self.denim_activation_block_number();
+
+        if denim_activation_block.is_none_or(|activation| blocks_since_genesis < activation) {
+            return blocks_since_genesis
+                .checked_mul(self.block_time)
+                .and_then(|offset| self.genesis.l2_time.checked_add(offset));
+        }
+
+        let denim_activation_block = denim_activation_block?;
+        let activation_timestamp = denim_activation_block
+            .checked_mul(self.block_time)
+            .and_then(|offset| self.genesis.l2_time.checked_add(offset))?;
+        let denim_seconds = (u128::from(blocks_since_genesis - denim_activation_block)
+            * u128::from(Self::NATIVE_SUBSECOND_BLOCK_INTERVAL_MILLIS))
+            / 1_000;
+        u64::try_from(u128::from(activation_timestamp) + denim_seconds).ok()
+    }
+
     /// Returns the deterministic timestamp split into `(seconds, millis_part)`.
     pub fn l2_block_timestamp_parts(&self, block_number: u64) -> (u64, u16) {
         let full_millis = self.l2_block_timestamp_millis(block_number);
@@ -1243,6 +1271,67 @@ mod tests {
     fn l2_block_full_millis_saturates() {
         let saturating = rollup_config_with_denim(u64::MAX, u64::MAX, None);
         assert_eq!(saturating.l2_block_timestamp_millis(1), u64::MAX);
+    }
+
+    #[test]
+    fn checked_l2_block_timestamp_uses_denim_cadence() {
+        let mut cfg = rollup_config_with_denim(1_000, 2, Some(1_005));
+        cfg.genesis.l2.number = 1_000;
+
+        for (block_number, expected) in [
+            (1_001, 1_002),
+            (1_002, 1_004),
+            (1_003, 1_006),
+            (1_004, 1_006),
+            (1_005, 1_006),
+            (1_006, 1_006),
+            (1_007, 1_006),
+            (1_008, 1_007),
+        ] {
+            assert_eq!(cfg.checked_l2_block_timestamp(block_number), Some(expected));
+        }
+
+        assert_eq!(cfg.checked_l2_block_timestamp(999), None);
+        cfg.block_time = 0;
+        assert_eq!(cfg.checked_l2_block_timestamp(1_000), None);
+    }
+
+    #[test]
+    fn checked_l2_block_timestamp_matches_representable_saturating_results() {
+        for (cfg, block_number) in [
+            (rollup_config_with_denim(10, 2, None), 4),
+            (rollup_config_with_denim(1_000, 2, Some(999)), 5),
+        ] {
+            assert_eq!(
+                cfg.checked_l2_block_timestamp(block_number),
+                Some(cfg.l2_block_timestamp(block_number))
+            );
+        }
+
+        let large = rollup_config_with_denim(u64::MAX - 10, 2, None);
+        assert_eq!(large.checked_l2_block_timestamp(5), Some(u64::MAX));
+    }
+
+    #[test]
+    fn checked_l2_block_timestamp_avoids_millisecond_intermediate_overflow() {
+        let mut cfg = rollup_config_with_denim(u64::MAX - 10, 2, Some(u64::MAX - 10));
+        cfg.genesis.l2.number = 100;
+
+        assert_eq!(cfg.checked_l2_block_timestamp(149), Some(u64::MAX - 1));
+
+        let mut cfg = rollup_config_with_denim(u64::MAX - 1, 2, Some(u64::MAX - 1));
+        cfg.genesis.l2.number = 100;
+        assert_eq!(cfg.checked_l2_block_timestamp(109), Some(u64::MAX));
+        assert_eq!(cfg.checked_l2_block_timestamp(110), None);
+    }
+
+    #[test]
+    fn checked_l2_block_timestamp_rejects_legacy_overflow() {
+        let multiplication_overflow = rollup_config_with_denim(1, u64::MAX, None);
+        let addition_overflow = rollup_config_with_denim(u64::MAX, 2, None);
+
+        assert_eq!(multiplication_overflow.checked_l2_block_timestamp(2), None);
+        assert_eq!(addition_overflow.checked_l2_block_timestamp(1), None);
     }
 
     #[test]
