@@ -291,6 +291,7 @@ pub struct SystemTestStackBuilder {
     tx_forwarding_config: Option<TxForwardingConfig>,
     enable_experimental_validity_transactions: bool,
     verifier_l1_confs: u64,
+    force_batch_submission: bool,
     client_consensus_mode: L2ClientConsensusMode,
     shadow_sequencer_count: usize,
     shadow_blocks_per_cycle: Option<NonZeroU64>,
@@ -411,6 +412,15 @@ impl SystemTestStackBuilder {
     /// client (validator) node's derivation pipeline.
     pub const fn with_verifier_l1_confs(mut self, confs: u64) -> Self {
         self.verifier_l1_confs = confs;
+        self
+    }
+
+    /// Posts L2 batches as short-lived calldata so the derived safe head can catch up.
+    ///
+    /// Required for tests that wait on safe L2: the default blob batcher does not make
+    /// that progress on this stack.
+    pub const fn with_force_batch_submission(mut self) -> Self {
+        self.force_batch_submission = true;
         self
     }
 
@@ -687,6 +697,7 @@ impl SystemTestStackBuilder {
             enable_experimental_validity_transactions: self
                 .enable_experimental_validity_transactions,
             verifier_l1_confs: self.verifier_l1_confs,
+            force_batch_submission: self.force_batch_submission,
             client_consensus_mode: self.client_consensus_mode,
             upgrade_signal: l2_upgrade_signal,
             execution_upgrade_signal: l2_execution_upgrade_signal,
