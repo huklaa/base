@@ -69,6 +69,9 @@ pub enum FrameDecodingError {
     /// Error decoding the frame data length.
     #[error("Invalid frame data length")]
     InvalidDataLength,
+    /// The final-frame flag must be encoded canonically as 0 or 1.
+    #[error("Invalid is_last byte: {0}")]
+    InvalidIsLast(u8),
 }
 
 /// Frame parsing error.
@@ -235,7 +238,11 @@ impl Frame {
         }
 
         let data = encoded[22..22 + data_len].to_vec();
-        let is_last = encoded[22 + data_len] == 1;
+        let is_last = match encoded[22 + data_len] {
+            0 => false,
+            1 => true,
+            byte => return Err(FrameDecodingError::InvalidIsLast(byte)),
+        };
         Ok((Self::ENCODED_OVERHEAD + data_len, Self { id, number, data, is_last }))
     }
 
@@ -337,6 +344,30 @@ mod tests {
         encoded[18..22].copy_from_slice(&valid_data_len.to_be_bytes());
         let (_, frame_decoded) = Frame::decode(&encoded).unwrap();
         assert_eq!(frame, frame_decoded);
+    }
+
+    #[test]
+    fn test_decode_rejects_non_canonical_is_last() {
+        let frame = Frame { id: [0xFF; 16], number: 0xEE, data: vec![0xDD; 4], is_last: false };
+
+        for byte in [0x02, 0xFF] {
+            let mut encoded = frame.encode();
+            *encoded.last_mut().unwrap() = byte;
+            assert_eq!(Frame::decode(&encoded), Err(FrameDecodingError::InvalidIsLast(byte)));
+        }
+    }
+
+    #[test]
+    fn test_parse_frames_rejects_non_canonical_is_last() {
+        let frame = Frame { id: [0xFF; 16], number: 0xEE, data: vec![0xDD; 4], is_last: false };
+        let mut encoded = vec![DERIVATION_VERSION_0];
+        encoded.extend_from_slice(&frame.encode());
+        *encoded.last_mut().unwrap() = 0x02;
+
+        assert_eq!(
+            Frame::parse_frames(&encoded),
+            Err(FrameParseError::FrameDecodingError(FrameDecodingError::InvalidIsLast(0x02)))
+        );
     }
 
     #[test]
