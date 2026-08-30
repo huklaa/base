@@ -106,7 +106,6 @@ reth-node-builder = { workspace = true, features = ["test-utils"] }
 alloy-eips.workspace = true
 alloy-network.workspace = true
 base-common-evm.workspace = true
-base-common-network.workspace = true
 
 [features]
 default = [ "reth-codec" ]
