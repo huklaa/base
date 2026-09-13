@@ -75,13 +75,28 @@ cleanup_install() {
     fi
 }
 
+write_env_file() {
+    local file="$1"
+    local path_line="$2"
+
+    if [[ -f "$file" ]] && [[ "$(head -n 1 "$file")" != "# base shell setup" ]]; then
+        return
+    fi
+
+    if [[ -f "$file" ]]; then
+        {
+            printf '%s\n' "# base shell setup" "$path_line"
+            tail -n +3 "$file"
+        } > "$file.new"
+        mv -f "$file.new" "$file"
+    else
+        printf '%s\n' "# base shell setup" "$path_line" > "$file"
+    fi
+}
+
 write_env_files() {
-    if [[ ! -f "$ENV_FILE" ]]; then
-        printf '%s\n' "# base shell setup" "export PATH=\"$BIN_DIR:\$PATH\"" > "$ENV_FILE"
-    fi
-    if [[ ! -f "$ENV_FILE.fish" ]]; then
-        printf '%s\n' "# base shell setup" "fish_add_path -g \"$BIN_DIR\"" > "$ENV_FILE.fish"
-    fi
+    write_env_file "$ENV_FILE" "export PATH=\"$BIN_DIR:\$PATH\""
+    write_env_file "$ENV_FILE.fish" "fish_add_path -g \"$BIN_DIR\""
 }
 
 configure_shell() {
