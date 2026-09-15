@@ -84,6 +84,27 @@ write_env_files() {
     fi
 }
 
+config_sources_file() {
+    local cfg="$1"
+    shift
+    local line
+    local trimmed
+    local expected
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+
+        for expected in "$@"; do
+            if [[ "$trimmed" == "$expected" ]]; then
+                return 0
+            fi
+        done
+    done < "$cfg"
+
+    return 1
+}
+
 configure_shell() {
     local source_line=". \"$ENV_FILE\""
     local fish_source_line="source \"$ENV_FILE.fish\""
@@ -129,7 +150,7 @@ configure_shell() {
         [[ -f "$cfg" ]] || continue
         found_existing_config=1
 
-        if grep -qF "$ENV_FILE" "$cfg" 2>/dev/null; then
+        if config_sources_file "$cfg" "$source_line" "source \"$ENV_FILE\""; then
             continue
         fi
 
@@ -143,7 +164,7 @@ configure_shell() {
     local fish_config="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
     if [[ -f "$fish_config" ]]; then
         found_existing_config=1
-        if ! grep -qF "$ENV_FILE.fish" "$fish_config" 2>/dev/null; then
+        if ! config_sources_file "$fish_config" "$fish_source_line"; then
             echo >> "$fish_config"
             echo "# Added by baseup installer" >> "$fish_config"
             echo "$fish_source_line" >> "$fish_config"
