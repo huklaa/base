@@ -48,16 +48,19 @@ ensure_writable_destination() {
 install_bin() {
     local src="$1"
     local dst="$2"
+    local tmp_dir
     local tmp_dst
 
     ensure_writable_destination "$dst"
 
-    tmp_dst="$(mktemp "$(dirname "$dst")/.baseup-install.XXXXXX" 2>/dev/null)" || error "failed to create temporary file for $dst"
+    tmp_dir="$(mktemp -d "$(dirname "$dst")/.baseup-install.XXXXXX" 2>/dev/null)" || error "failed to create temporary directory for $dst"
+    tmp_dst="$tmp_dir/$(basename "$dst")"
 
     if cp "$src" "$tmp_dst" 2>/dev/null && chmod +x "$tmp_dst" && mv -f "$tmp_dst" "$dst"; then
-        :
+        rmdir "$tmp_dir" 2>/dev/null || true
     else
         rm -f "$tmp_dst" 2>/dev/null || true
+        rmdir "$tmp_dir" 2>/dev/null || true
         error "failed to install to $dst"
     fi
 }
