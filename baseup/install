@@ -129,7 +129,7 @@ configure_shell() {
         [[ -f "$cfg" ]] || continue
         found_existing_config=1
 
-        if grep -qF "$ENV_FILE" "$cfg" 2>/dev/null; then
+        if grep -Fqx "$source_line" "$cfg" 2>/dev/null; then
             continue
         fi
 
@@ -143,7 +143,7 @@ configure_shell() {
     local fish_config="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
     if [[ -f "$fish_config" ]]; then
         found_existing_config=1
-        if ! grep -qF "$ENV_FILE.fish" "$fish_config" 2>/dev/null; then
+        if ! grep -Fqx "$fish_source_line" "$fish_config" 2>/dev/null; then
             echo >> "$fish_config"
             echo "# Added by baseup installer" >> "$fish_config"
             echo "$fish_source_line" >> "$fish_config"
