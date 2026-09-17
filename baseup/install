@@ -76,12 +76,64 @@ cleanup_install() {
 }
 
 write_env_files() {
-    if [[ ! -f "$ENV_FILE" ]]; then
-        printf '%s\n' "# base shell setup" "export PATH=\"$BIN_DIR:\$PATH\"" > "$ENV_FILE"
+    write_env_file "$ENV_FILE" "export PATH=\"$BIN_DIR:\$PATH\"" "shell"
+    write_env_file "$ENV_FILE.fish" "fish_add_path -g \"$BIN_DIR\"" "fish"
+}
+
+write_env_file() {
+    local env_file="$1"
+    local managed_line="$2"
+    local env_kind="$3"
+    local marker="# base shell setup"
+    local current_line=""
+    local replace_next=0
+    local tmp_file="${env_file}.new"
+
+    if [[ ! -f "$env_file" ]]; then
+        printf '%s\n' "$marker" "$managed_line" > "$env_file"
+        return
     fi
-    if [[ ! -f "$ENV_FILE.fish" ]]; then
-        printf '%s\n' "# base shell setup" "fish_add_path -g \"$BIN_DIR\"" > "$ENV_FILE.fish"
-    fi
+
+    current_line="$(awk -v marker="$marker" '$0 == marker { getline; print; exit }' "$env_file")"
+    case "$env_kind" in
+        shell)
+            [[ "$current_line" == 'export PATH="'*':$PATH"' ]] && replace_next=1
+            ;;
+        fish)
+            [[ "$current_line" == 'fish_add_path -g "'*'"' ]] && replace_next=1
+            ;;
+    esac
+
+    awk \
+        -v marker="$marker" \
+        -v managed_line="$managed_line" \
+        -v replace_next="$replace_next" \
+        '
+            !updated && $0 == marker {
+                print
+                if (replace_next) {
+                    getline
+                }
+                print managed_line
+                updated = 1
+                next
+            }
+            { print }
+            END {
+                if (!updated) {
+                    if (NR > 0) {
+                        print ""
+                    }
+                    print marker
+                    print managed_line
+                }
+            }
+        ' "$env_file" 2>/dev/null > "$tmp_file" || {
+            rm -f "$tmp_file"
+            error "failed to update $env_file"
+        }
+
+    mv -f "$tmp_file" "$env_file"
 }
 
 configure_shell() {
