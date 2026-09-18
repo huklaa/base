@@ -90,6 +90,7 @@ configure_shell() {
     local shell_configs=()
     local cfg
     local found_existing_config=0
+    local skipped_unwritable=0
 
     if [[ -n "${ZDOTDIR:-}" ]]; then
         shell_configs+=("$ZDOTDIR/.zshenv")
@@ -133,9 +134,17 @@ configure_shell() {
             continue
         fi
 
-        echo >> "$cfg"
-        echo "# Added by baseup installer" >> "$cfg"
-        echo "$source_line" >> "$cfg"
+        if [[ ! -w "$cfg" ]]; then
+            warn "shell config $cfg is not writable; leaving it unchanged"
+            skipped_unwritable=1
+            continue
+        fi
+
+        if ! printf '\n%s\n%s\n' "# Added by baseup installer" "$source_line" >> "$cfg"; then
+            warn "failed to update shell config $cfg; leaving it unchanged"
+            skipped_unwritable=1
+            continue
+        fi
         info "Added Base to PATH in $cfg"
         modified=1
     done
@@ -143,10 +152,15 @@ configure_shell() {
     local fish_config="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
     if [[ -f "$fish_config" ]]; then
         found_existing_config=1
-        if ! grep -qF "$ENV_FILE.fish" "$fish_config" 2>/dev/null; then
-            echo >> "$fish_config"
-            echo "# Added by baseup installer" >> "$fish_config"
-            echo "$fish_source_line" >> "$fish_config"
+        if grep -qF "$ENV_FILE.fish" "$fish_config" 2>/dev/null; then
+            :
+        elif [[ ! -w "$fish_config" ]]; then
+            warn "shell config $fish_config is not writable; leaving it unchanged"
+            skipped_unwritable=1
+        elif ! printf '\n%s\n%s\n' "# Added by baseup installer" "$fish_source_line" >> "$fish_config"; then
+            warn "failed to update shell config $fish_config; leaving it unchanged"
+            skipped_unwritable=1
+        else
             info "Added Base to PATH in $fish_config"
             modified=1
         fi
@@ -155,7 +169,7 @@ configure_shell() {
     if [[ $modified -eq 0 ]]; then
         if [[ $found_existing_config -eq 0 ]]; then
             info "No existing shell config file found; leaving PATH unchanged"
-        else
+        elif [[ $skipped_unwritable -eq 0 ]]; then
             info "Base is already configured in your shell"
         fi
     fi
