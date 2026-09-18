@@ -35,6 +35,10 @@ ensure_writable_destination() {
     local dst="$1"
     local parent
 
+    if [[ -d "$dst" ]]; then
+        error "destination $dst is a directory; choose a different BASE_BIN_DIR"
+    fi
+
     if [[ -e "$dst" ]]; then
         [[ -w "$dst" ]] && return
     else
