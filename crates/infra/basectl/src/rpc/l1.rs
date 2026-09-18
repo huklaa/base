@@ -76,14 +76,16 @@ pub async fn fetch_full_system_config(
         blobbasefee_scalar_call.call(),
     );
 
+    let gas_limit = gas_limit.context("fetching gasLimit() from L1 SystemConfig")?;
+    let batcher_hash = batcher_hash.context("fetching batcherHash() from L1 SystemConfig")?;
+    let overhead = overhead.context("fetching overhead() from L1 SystemConfig")?;
+    let scalar = scalar.context("fetching scalar() from L1 SystemConfig")?;
+
     Ok(SystemConfig {
-        batcher_address: batcher_hash
-            .ok()
-            .map(|h| Address::from_slice(&h.0[12..]))
-            .unwrap_or_default(),
-        overhead: overhead.ok().unwrap_or_default(),
-        scalar: scalar.ok().unwrap_or_default(),
-        gas_limit: gas_limit.ok().unwrap_or_default(),
+        batcher_address: Address::from_slice(&batcher_hash.0[12..]),
+        overhead,
+        scalar,
+        gas_limit,
         eip1559_elasticity: eip1559_elasticity.ok(),
         eip1559_denominator: eip1559_denominator.ok(),
         base_fee_scalar: basefee_scalar.ok().map(|v| v as u64),
