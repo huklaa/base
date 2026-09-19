@@ -57,6 +57,7 @@ revm = { workspace = true, features = [
 	"secp256k1",
 	"blst",
 	"c-kzg",
+	"portable",
 	"memory_limit",
 ] }
 
