@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use alloy_consensus::Transaction;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder, layers::CallBatchLayer};
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::BlockNumberOrTag;
@@ -77,6 +77,31 @@ pub async fn fetch_full_system_config(
         blobbasefee_scalar_call.call(),
     );
 
+    system_config_from_results(
+        gas_limit,
+        eip1559_elasticity,
+        eip1559_denominator,
+        batcher_hash,
+        overhead,
+        scalar,
+        basefee_scalar,
+        blobbasefee_scalar,
+    )
+}
+
+fn system_config_from_results<E>(
+    gas_limit: std::result::Result<u64, E>,
+    eip1559_elasticity: std::result::Result<u32, E>,
+    eip1559_denominator: std::result::Result<u32, E>,
+    batcher_hash: std::result::Result<B256, E>,
+    overhead: std::result::Result<U256, E>,
+    scalar: std::result::Result<U256, E>,
+    basefee_scalar: std::result::Result<u32, E>,
+    blobbasefee_scalar: std::result::Result<u32, E>,
+) -> Result<SystemConfig>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     let gas_limit = gas_limit.context("fetching SystemConfig.gasLimit")?;
     let batcher_hash = batcher_hash.context("fetching SystemConfig.batcherHash")?;
     let overhead = overhead.context("fetching SystemConfig.overhead")?;
@@ -284,5 +309,53 @@ fn extract_l1_block_info(
         timestamp: block.header.timestamp,
         total_blobs,
         base_blobs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Error;
+
+    use super::*;
+
+    #[test]
+    fn required_system_config_failure_is_propagated() {
+        let err = system_config_from_results(
+            Err(Error::other("gas limit RPC failed")),
+            Ok(6),
+            Ok(50),
+            Ok(B256::ZERO),
+            Ok(U256::from(1)),
+            Ok(U256::from(2)),
+            Ok(3),
+            Ok(4),
+        )
+        .expect_err("required gasLimit failure must not be converted to zero");
+
+        assert!(err.to_string().contains("fetching SystemConfig.gasLimit"));
+    }
+
+    #[test]
+    fn optional_system_config_failures_keep_compatibility_fallbacks() {
+        let config = system_config_from_results(
+            Ok(30_000_000),
+            Err(Error::other("elasticity unavailable")),
+            Err(Error::other("denominator unavailable")),
+            Ok(B256::ZERO),
+            Ok(U256::from(1)),
+            Ok(U256::from(2)),
+            Err(Error::other("base fee scalar unavailable")),
+            Err(Error::other("blob base fee scalar unavailable")),
+        )
+        .expect("optional fields should retain compatibility fallback behavior");
+
+        assert_eq!(config.gas_limit, 30_000_000);
+        assert_eq!(config.batcher_address, Address::ZERO);
+        assert_eq!(config.overhead, U256::from(1));
+        assert_eq!(config.scalar, U256::from(2));
+        assert_eq!(config.eip1559_elasticity, None);
+        assert_eq!(config.eip1559_denominator, None);
+        assert_eq!(config.base_fee_scalar, None);
+        assert_eq!(config.blob_base_fee_scalar, None);
     }
 }
