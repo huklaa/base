@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use alloy_consensus::Transaction;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder, layers::CallBatchLayer};
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::BlockNumberOrTag;
@@ -28,6 +28,31 @@ sol! {
         function basefeeScalar() external view returns (uint32);
         function blobbasefeeScalar() external view returns (uint32);
     }
+}
+
+fn system_config_from_call_results<E>(
+    gas_limit: std::result::Result<u64, E>,
+    eip1559_elasticity: std::result::Result<u32, E>,
+    eip1559_denominator: std::result::Result<u32, E>,
+    batcher_hash: std::result::Result<B256, E>,
+    overhead: std::result::Result<U256, E>,
+    scalar: std::result::Result<U256, E>,
+    basefee_scalar: std::result::Result<u32, E>,
+    blobbasefee_scalar: std::result::Result<u32, E>,
+) -> Result<SystemConfig>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    system_config_from_call_results(
+        gas_limit,
+        eip1559_elasticity,
+        eip1559_denominator,
+        batcher_hash,
+        overhead,
+        scalar,
+        basefee_scalar,
+        blobbasefee_scalar,
+    )
 }
 
 /// Fetch all available `SystemConfig` values from the L1 contract.
@@ -283,5 +308,58 @@ fn extract_l1_block_info(
         timestamp: block.header.timestamp,
         total_blobs,
         base_blobs,
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::system_config_from_call_results;
+    use alloy_primitives::{B256, U256};
+
+    fn rpc_error() -> io::Error {
+        io::Error::new(io::ErrorKind::Other, "rpc unavailable")
+    }
+
+    #[test]
+    fn required_system_config_failure_is_propagated() {
+        let result = system_config_from_call_results::<io::Error>(
+            Err(rpc_error()),
+            Ok(10),
+            Ok(50),
+            Ok(B256::ZERO),
+            Ok(U256::ZERO),
+            Ok(U256::ZERO),
+            Ok(1),
+            Ok(2),
+        );
+
+        let error = result.expect_err("gasLimit failure must not become a zero value");
+        assert!(error.to_string().contains("fetching gasLimit() from L1 SystemConfig"));
+    }
+
+    #[test]
+    fn optional_system_config_failures_still_fall_back() {
+        let config = system_config_from_call_results::<io::Error>(
+            Ok(30_000_000),
+            Err(rpc_error()),
+            Err(rpc_error()),
+            Ok(B256::ZERO),
+            Ok(U256::from(188_u64)),
+            Ok(U256::from(684_000_u64)),
+            Err(rpc_error()),
+            Err(rpc_error()),
+        )
+        .expect("optional version-gated fields should remain compatible");
+
+        assert_eq!(config.gas_limit, 30_000_000);
+        assert_eq!(config.overhead, U256::from(188_u64));
+        assert_eq!(config.scalar, U256::from(684_000_u64));
+        assert_eq!(config.eip1559_elasticity, None);
+        assert_eq!(config.eip1559_denominator, None);
+        assert_eq!(config.base_fee_scalar, None);
+        assert_eq!(config.blob_base_fee_scalar, None);
     }
 }
