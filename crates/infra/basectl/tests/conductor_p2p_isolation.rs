@@ -42,8 +42,7 @@ fn rpc_error(message: &'static str) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(-32000, message, None::<()>)
 }
 
-#[tokio::test]
-async fn pause_fails_when_cl_disconnect_errors() -> Result<()> {
+fn peer_dump() -> PeerDump {
     let mut dump = PeerDump::default();
     let peer = PeerInfo {
         peer_id: "peer-1".to_string(),
@@ -52,7 +51,12 @@ async fn pause_fails_when_cl_disconnect_errors() -> Result<()> {
     };
     dump.total_connected = 1;
     dump.peers.insert(peer.peer_id.clone(), peer);
+    dump
+}
 
+#[tokio::test]
+async fn pause_fails_when_cl_disconnect_errors() -> Result<()> {
+    let dump = peer_dump();
     let mut module = RpcModule::new(());
     module.register_method("opp2p_peers", move |_, _, _| {
         Ok::<_, ErrorObjectOwned>(dump.clone())
@@ -110,5 +114,31 @@ async fn pause_fails_when_el_remove_peer_is_rejected() -> Result<()> {
     let result = run_pause(node(cl_rpc, Some(el_rpc))).await;
 
     assert!(result.is_err(), "rejected EL peer removal must not be reported as isolated");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_succeeds_when_all_peer_disconnects_succeed() -> Result<()> {
+    let dump = peer_dump();
+    let mut cl_module = RpcModule::new(());
+    cl_module.register_method("opp2p_peers", move |_, _, _| {
+        Ok::<_, ErrorObjectOwned>(dump.clone())
+    })?;
+    cl_module.register_method("opp2p_disconnectPeer", |_, _, _| Ok::<_, ErrorObjectOwned>(()))?;
+    let (cl_rpc, _cl_handle) = spawn_server(cl_module).await?;
+
+    let mut el_module = RpcModule::new(());
+    el_module.register_method("admin_peers", |_, _, _| {
+        Ok::<_, ErrorObjectOwned>(vec![json!({"enode": "enode://peer-2@127.0.0.1:30303"})])
+    })?;
+    el_module.register_method("admin_removePeer", |_, _, _| Ok::<_, ErrorObjectOwned>(true))?;
+    let (el_rpc, _el_handle) = spawn_server(el_module).await?;
+
+    let (_, peers) = run_pause(node(cl_rpc, Some(el_rpc)))
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(peers.cl_addrs, vec!["/ip4/127.0.0.1/tcp/9000"]);
+    assert_eq!(peers.el_enodes, vec!["enode://peer-2@127.0.0.1:30303"]);
     Ok(())
 }
