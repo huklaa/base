@@ -21,5 +21,10 @@ fn main() {
 
     let cli = base_cli_utils::parse_cli!(NodeCli);
 
-    cli.run(|builder, args| async move { StandardBaseRethNode::run(builder, args).await }).unwrap();
+    if let Err(err) =
+        cli.run(|builder, args| async move { StandardBaseRethNode::run(builder, args).await })
+    {
+        eprintln!("Error: {err:?}");
+        std::process::exit(1);
+    }
 }
