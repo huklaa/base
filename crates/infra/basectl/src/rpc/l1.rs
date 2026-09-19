@@ -33,7 +33,7 @@ sol! {
 /// Fetch all available `SystemConfig` values from the L1 contract.
 ///
 /// Uses Multicall3 via `CallBatchLayer` to batch all calls into a single RPC request.
-/// Fields that are absent on older contract versions fall back to their defaults.
+/// Version-gated fields that are absent on older contract versions fall back to their defaults.
 pub async fn fetch_full_system_config(
     l1_rpc_url: &str,
     system_config_address: Address,
@@ -55,7 +55,8 @@ pub async fn fetch_full_system_config(
     let basefee_scalar_call = contract.basefeeScalar();
     let blobbasefee_scalar_call = contract.blobbasefeeScalar();
 
-    // Fetch all values concurrently - each may fail on older versions
+    // Fetch all values concurrently. Required legacy/core fields must succeed;
+    // version-gated fields may be absent on older versions.
     let (
         gas_limit,
         eip1559_elasticity,
@@ -76,14 +77,16 @@ pub async fn fetch_full_system_config(
         blobbasefee_scalar_call.call(),
     );
 
+    let gas_limit = gas_limit.context("fetching SystemConfig.gasLimit")?;
+    let batcher_hash = batcher_hash.context("fetching SystemConfig.batcherHash")?;
+    let overhead = overhead.context("fetching SystemConfig.overhead")?;
+    let scalar = scalar.context("fetching SystemConfig.scalar")?;
+
     Ok(SystemConfig {
-        batcher_address: batcher_hash
-            .ok()
-            .map(|h| Address::from_slice(&h.0[12..]))
-            .unwrap_or_default(),
-        overhead: overhead.ok().unwrap_or_default(),
-        scalar: scalar.ok().unwrap_or_default(),
-        gas_limit: gas_limit.ok().unwrap_or_default(),
+        batcher_address: Address::from_slice(&batcher_hash.0[12..]),
+        overhead,
+        scalar,
+        gas_limit,
         eip1559_elasticity: eip1559_elasticity.ok(),
         eip1559_denominator: eip1559_denominator.ok(),
         base_fee_scalar: basefee_scalar.ok().map(|v| v as u64),
