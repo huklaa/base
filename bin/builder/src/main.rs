@@ -34,7 +34,7 @@ fn main() {
 
     let cli = base_cli_utils::parse_cli!(BuilderCli);
 
-    cli.run(|builder, builder_args| async move {
+    if let Err(err) = cli.run(|builder, builder_args| async move {
         let rollup_args = builder_args.rollup_args.clone();
         let builder =
             StandardBaseRethNode::apply_initial_upgrade_signal(builder, &builder_args).await?;
@@ -87,6 +87,8 @@ fn main() {
         });
 
         runner.run(builder).await
-    })
-    .unwrap();
+    }) {
+        eprintln!("Error: {err:?}");
+        std::process::exit(1);
+    }
 }
