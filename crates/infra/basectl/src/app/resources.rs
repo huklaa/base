@@ -261,6 +261,7 @@ pub struct DaState {
     buffered_safe_heads: Vec<u64>,
     recent_flashblock_ids: VecDeque<(u64, u64)>,
     recent_flashblock_id_set: HashSet<(u64, u64)>,
+    pending_block_requests: VecDeque<u64>,
     fb_rx: Option<mpsc::Receiver<Flashblock>>,
     sync_rx: Option<mpsc::Receiver<u64>>,
     backlog_rx: Option<mpsc::Receiver<BacklogFetchResult>>,
@@ -376,6 +377,7 @@ impl DaState {
             buffered_safe_heads: Vec::new(),
             recent_flashblock_ids: VecDeque::with_capacity(MAX_RECENT_DA_FLASHBLOCK_IDS),
             recent_flashblock_id_set: HashSet::with_capacity(MAX_RECENT_DA_FLASHBLOCK_IDS),
+            pending_block_requests: VecDeque::new(),
             fb_rx: None,
             sync_rx: None,
             backlog_rx: None,
@@ -474,6 +476,8 @@ impl DaState {
             }
         }
 
+        self.flush_block_requests();
+
         let block_infos: Vec<_> = self
             .block_res_rx
             .as_mut()
@@ -522,6 +526,23 @@ impl DaState {
         }
     }
 
+    fn flush_block_requests(&mut self) {
+        let Some(tx) = self.block_req_tx.clone() else { return };
+        while let Some(block_number) = self.pending_block_requests.pop_front() {
+            match tx.try_send(block_number) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(block_number)) => {
+                    self.pending_block_requests.push_front(block_number);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending_block_requests.clear();
+                    break;
+                }
+            }
+        }
+    }
+
     fn remember_flashblock_id(&mut self, block_number: u64, index: u64) -> bool {
         let id = (block_number, index);
         if !self.recent_flashblock_id_set.insert(id) {
@@ -563,10 +584,8 @@ impl DaState {
                 contrib.tx_count = tx_count;
             }
 
-            if let (Some(prev), Some(tx)) = (prev_block, &self.block_req_tx) {
-                for missing in (prev..block_number).rev() {
-                    let _ = tx.try_send(missing);
-                }
+            if let Some(prev) = prev_block {
+                self.pending_block_requests.extend(((prev + 1)..block_number).rev());
             }
         } else if let Some(contrib) =
             self.tracker.block_contributions.iter_mut().find(|c| c.block_number == block_number)
@@ -722,6 +741,7 @@ impl FlashState {
 mod tests {
     use std::future;
 
+    use base_common_flashblocks::{ExecutionPayloadFlashblockDeltaV1, Flashblock, Metadata};
     use tokio::sync::mpsc;
 
     use super::{DaState, Resources};
@@ -729,6 +749,16 @@ mod tests {
         MonitoringConfig,
         rpc::{BacklogFetchResult, BlockDaInfo, L1BlockInfo},
     };
+
+    fn make_flashblock(block_number: u64, index: u64) -> Flashblock {
+        Flashblock {
+            payload_id: Default::default(),
+            index,
+            base: None,
+            diff: ExecutionPayloadFlashblockDeltaV1::default(),
+            metadata: Metadata::new(block_number),
+        }
+    }
 
     #[tokio::test]
     async fn dropping_resources_aborts_background_tasks() {
@@ -767,6 +797,28 @@ mod tests {
         assert!(!state.loaded);
         assert_eq!(state.tracker.l1_blocks.len(), 1);
         assert_eq!(state.tracker.l1_blocks.front().unwrap().block_number, 123);
+    }
+
+    #[test]
+    fn retries_gap_requests_when_fetch_channel_is_full() {
+        let (block_req_tx, mut block_req_rx) = mpsc::channel(2);
+        let mut state = DaState::new();
+        state.block_req_tx = Some(block_req_tx);
+        state.tracker.add_block(100, 1, 1);
+
+        state.process_flashblock(&make_flashblock(105, 0));
+        state.flush_block_requests();
+
+        assert_eq!(block_req_rx.try_recv().unwrap(), 104);
+        assert_eq!(block_req_rx.try_recv().unwrap(), 103);
+        assert_eq!(state.pending_block_requests.iter().copied().collect::<Vec<_>>(), vec![102, 101]);
+
+        state.poll();
+
+        assert_eq!(block_req_rx.try_recv().unwrap(), 102);
+        assert_eq!(block_req_rx.try_recv().unwrap(), 101);
+        assert!(state.pending_block_requests.is_empty());
+        assert!(block_req_rx.try_recv().is_err());
     }
 
     #[test]
