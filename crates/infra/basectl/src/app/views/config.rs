@@ -1,14 +1,18 @@
+use anyhow::Result;
+use base_common_genesis::SystemConfig;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     prelude::*,
     widgets::{Block, Borders, Paragraph},
 };
+use tokio::sync::oneshot;
 
 use crate::{
     app::{Action, Resources, View},
     output::COLOR_BASE_BLUE,
-    tui::Keybinding,
+    rpc::fetch_full_system_config,
+    tui::{Keybinding, Toast},
 };
 
 const KEYBINDINGS: &[Keybinding] = &[
@@ -20,7 +24,7 @@ const KEYBINDINGS: &[Keybinding] = &[
 /// View displaying chain configuration and L1 system config parameters.
 #[derive(Debug)]
 pub struct ConfigView {
-    needs_refresh: bool,
+    refresh_rx: Option<oneshot::Receiver<Result<SystemConfig>>>,
 }
 
 impl Default for ConfigView {
@@ -32,7 +36,7 @@ impl Default for ConfigView {
 impl ConfigView {
     /// Creates a new config view.
     pub const fn new() -> Self {
-        Self { needs_refresh: true }
+        Self { refresh_rx: None }
     }
 }
 
@@ -41,14 +45,55 @@ impl View for ConfigView {
         KEYBINDINGS
     }
 
-    fn handle_key(&mut self, key: KeyEvent, _resources: &mut Resources) -> Action {
-        match key.code {
-            KeyCode::Char('r') => {
-                self.needs_refresh = true;
-                Action::None
-            }
-            _ => Action::None,
+    fn handle_key(&mut self, key: KeyEvent, resources: &mut Resources) -> Action {
+        if key.code == KeyCode::Char('r') && self.refresh_rx.is_none() {
+            let l1_rpc = resources.config.l1_rpc.to_string();
+            let system_config_addr = resources.config.system_config;
+            let (tx, rx) = oneshot::channel();
+            self.refresh_rx = Some(rx);
+            resources.toasts.push(Toast::info("Refreshing system config…".to_string()));
+
+            tokio::spawn(async move {
+                let _ = tx.send(fetch_full_system_config(&l1_rpc, system_config_addr).await);
+            });
         }
+        Action::None
+    }
+
+    fn tick(&mut self, resources: &mut Resources) -> Action {
+        let outcome = {
+            let Some(rx) = self.refresh_rx.as_mut() else {
+                return Action::None;
+            };
+            match rx.try_recv() {
+                Ok(result) => Some(Ok(result)),
+                Err(oneshot::error::TryRecvError::Empty) => None,
+                Err(oneshot::error::TryRecvError::Closed) => Some(Err(())),
+            }
+        };
+
+        match outcome {
+            Some(Ok(Ok(system_config))) => {
+                self.refresh_rx = None;
+                resources.system_config = Some(system_config);
+                resources.toasts.push(Toast::info("System config refreshed".to_string()));
+            }
+            Some(Ok(Err(error))) => {
+                self.refresh_rx = None;
+                resources
+                    .toasts
+                    .push(Toast::warning(format!("System config refresh failed: {error}")));
+            }
+            Some(Err(())) => {
+                self.refresh_rx = None;
+                resources
+                    .toasts
+                    .push(Toast::warning("System config refresh task dropped".to_string()));
+            }
+            None => {}
+        }
+
+        Action::None
     }
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, resources: &Resources) {
@@ -155,4 +200,40 @@ fn render_system_config(f: &mut Frame<'_>, area: Rect, resources: &Resources) {
     );
 
     f.render_widget(content.block(block), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MonitoringConfig;
+
+    #[test]
+    fn completed_refresh_updates_system_config() {
+        let mut view = ConfigView::new();
+        let mut resources = Resources::new(MonitoringConfig::mainnet());
+        let expected = SystemConfig { gas_limit: 30_000_000, ..Default::default() };
+        let (tx, rx) = oneshot::channel();
+        view.refresh_rx = Some(rx);
+        tx.send(Ok(expected)).expect("refresh result receiver should be open");
+
+        assert_eq!(view.tick(&mut resources), Action::None);
+        assert_eq!(resources.system_config, Some(expected));
+        assert!(view.refresh_rx.is_none());
+    }
+
+    #[test]
+    fn failed_refresh_preserves_last_valid_system_config() {
+        let mut view = ConfigView::new();
+        let mut resources = Resources::new(MonitoringConfig::mainnet());
+        let existing = SystemConfig { gas_limit: 30_000_000, ..Default::default() };
+        resources.system_config = Some(existing);
+        let (tx, rx) = oneshot::channel();
+        view.refresh_rx = Some(rx);
+        tx.send(Err(anyhow::anyhow!("transient L1 failure")))
+            .expect("refresh result receiver should be open");
+
+        assert_eq!(view.tick(&mut resources), Action::None);
+        assert_eq!(resources.system_config, Some(existing));
+        assert!(view.refresh_rx.is_none());
+    }
 }
