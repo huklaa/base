@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use alloy_consensus::{Transaction, transaction::SignerRecoverable};
 use alloy_eips::{
@@ -22,6 +22,8 @@ use super::fetch_safe_and_latest;
 use crate::tui::Toast;
 
 const CONCURRENT_BLOCK_FETCHES: usize = 16;
+const BLOCK_FETCH_ATTEMPTS: usize = 3;
+const BLOCK_FETCH_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Fetches a single L2 block via `eth_getBlockByHash` or `eth_getBlockByNumber`.
 ///
@@ -153,6 +155,31 @@ async fn fetch_raw_block_info<P: Provider<Base>>(
     Some(RawBlockInfo { da_bytes, timestamp: block.header.timestamp })
 }
 
+async fn retry_optional<T, F, Fut>(
+    mut fetch: F,
+    max_attempts: usize,
+    initial_delay: Duration,
+) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    let mut delay = initial_delay;
+
+    for attempt in 0..max_attempts {
+        if let Some(value) = fetch().await {
+            return Some(value);
+        }
+
+        if attempt + 1 < max_attempts {
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2);
+        }
+    }
+
+    None
+}
+
 /// Fetches DA info for requested block numbers and sends results back.
 pub async fn run_block_fetcher(
     l2_rpc: String,
@@ -175,16 +202,32 @@ pub async fn run_block_fetcher(
     };
 
     while let Some(block_num) = request_rx.recv().await {
-        if let Some(info) = fetch_raw_block_info(&provider, block_num).await {
-            let block_info = BlockDaInfo {
-                block_number: block_num,
-                da_bytes: info.da_bytes,
-                timestamp: info.timestamp,
-            };
+        let Some(info) = retry_optional(
+            || fetch_raw_block_info(&provider, block_num),
+            BLOCK_FETCH_ATTEMPTS,
+            BLOCK_FETCH_RETRY_DELAY,
+        )
+        .await
+        else {
+            warn!(
+                block = block_num,
+                attempts = BLOCK_FETCH_ATTEMPTS,
+                "Failed to fetch DA block after retries"
+            );
+            let _ = toast_tx.try_send(Toast::warning(format!(
+                "Block {block_num} fetch failed after retries"
+            )));
+            continue;
+        };
 
-            if result_tx.send(block_info).await.is_err() {
-                break;
-            }
+        let block_info = BlockDaInfo {
+            block_number: block_num,
+            da_bytes: info.da_bytes,
+            timestamp: info.timestamp,
+        };
+
+        if result_tx.send(block_info).await.is_err() {
+            break;
         }
     }
 }
@@ -383,7 +426,12 @@ pub async fn fetch_block_transactions(
 
 #[cfg(test)]
 mod tests {
-    use super::effective_priority_fee_per_gas;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    use super::{effective_priority_fee_per_gas, retry_optional};
 
     #[test]
     fn priority_fee_uses_effective_gas_price_when_base_fee_known() {
@@ -398,5 +446,41 @@ mod tests {
     #[test]
     fn priority_fee_is_unknown_for_legacy_txs_when_base_fee_unknown() {
         assert_eq!(effective_priority_fee_per_gas(None, 125, None), None);
+    }
+
+    #[tokio::test]
+    async fn retry_optional_recovers_after_transient_failure() {
+        let attempts = AtomicUsize::new(0);
+
+        let value = retry_optional(
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move { (attempt >= 1).then_some(42_u64) }
+            },
+            3,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(value, Some(42));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_optional_stops_after_max_attempts() {
+        let attempts = AtomicUsize::new(0);
+
+        let value = retry_optional(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { None::<u64> }
+            },
+            3,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(value, None);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 }
