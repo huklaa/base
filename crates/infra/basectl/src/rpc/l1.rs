@@ -128,6 +128,46 @@ pub enum L1ConnectionMode {
     Polling,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchRangeOutcome {
+    Complete,
+    Retry,
+    ReceiverClosed,
+}
+
+async fn fetch_contiguous_l1_range<F, Fut>(
+    start: u64,
+    end: u64,
+    last_block: &mut Option<u64>,
+    result_tx: &mpsc::Sender<L1BlockInfo>,
+    mut fetch: F,
+) -> FetchRangeOutcome
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Option<L1BlockInfo>, String>>,
+{
+    for block_num in start..=end {
+        match fetch(block_num).await {
+            Ok(Some(info)) => {
+                if result_tx.send(info).await.is_err() {
+                    return FetchRangeOutcome::ReceiverClosed;
+                }
+                *last_block = Some(block_num);
+            }
+            Ok(None) => {
+                warn!(block_number = block_num, "L1 block unavailable; will retry");
+                return FetchRangeOutcome::Retry;
+            }
+            Err(error) => {
+                warn!(%error, block_number = block_num, "Failed to fetch L1 block; will retry");
+                return FetchRangeOutcome::Retry;
+            }
+        }
+    }
+
+    FetchRangeOutcome::Complete
+}
+
 fn http_to_ws(url: &str) -> String {
     url.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1)
 }
@@ -185,29 +225,35 @@ async fn run_l1_blob_watcher_ws(
     while let Some(header) = stream.next().await {
         let block_num = header.number;
 
-        let start = last_block.map_or(block_num, |last| last + 1);
-        for gap_num in start..block_num {
-            if let Ok(Some(block)) =
-                provider.get_block_by_number(BlockNumberOrTag::Number(gap_num)).full().await
-            {
-                let info = extract_l1_block_info(&block, batcher_address);
-                if result_tx.send(info).await.is_err() {
-                    return Ok(());
+        if block_num <= last_block.unwrap_or(0) {
+            continue;
+        }
+
+        let start = last_block.map_or(block_num, |last| last.saturating_add(1));
+        let outcome = fetch_contiguous_l1_range(
+            start,
+            block_num,
+            &mut last_block,
+            &result_tx,
+            |next_block| {
+                let provider = &provider;
+                async move {
+                    provider
+                        .get_block_by_number(BlockNumberOrTag::Number(next_block))
+                        .full()
+                        .await
+                        .map(|maybe_block| {
+                            maybe_block.map(|block| extract_l1_block_info(&block, batcher_address))
+                        })
+                        .map_err(|error| error.to_string())
                 }
-            }
-        }
+            },
+        )
+        .await;
 
-        if block_num > last_block.unwrap_or(0)
-            && let Ok(Some(block)) =
-                provider.get_block_by_number(BlockNumberOrTag::Number(block_num)).full().await
-        {
-            let info = extract_l1_block_info(&block, batcher_address);
-            if result_tx.send(info).await.is_err() {
-                return Ok(());
-            }
+        if outcome == FetchRangeOutcome::ReceiverClosed {
+            return Ok(());
         }
-
-        last_block = Some(block_num);
     }
 
     warn!("L1 WebSocket stream ended");
@@ -242,20 +288,31 @@ async fn run_l1_blob_watcher_poll(
             Err(_) => continue,
         };
 
-        let start_block = last_block.map_or(latest, |b| b + 1);
-
-        for block_num in start_block..=latest {
-            if let Ok(Some(block)) =
-                provider.get_block_by_number(BlockNumberOrTag::Number(block_num)).full().await
-            {
-                let info = extract_l1_block_info(&block, batcher_address);
-                if result_tx.send(info).await.is_err() {
-                    return;
+        let start_block = last_block.map_or(latest, |b| b.saturating_add(1));
+        let outcome = fetch_contiguous_l1_range(
+            start_block,
+            latest,
+            &mut last_block,
+            &result_tx,
+            |block_num| {
+                let provider = &provider;
+                async move {
+                    provider
+                        .get_block_by_number(BlockNumberOrTag::Number(block_num))
+                        .full()
+                        .await
+                        .map(|maybe_block| {
+                            maybe_block.map(|block| extract_l1_block_info(&block, batcher_address))
+                        })
+                        .map_err(|error| error.to_string())
                 }
-            }
-        }
+            },
+        )
+        .await;
 
-        last_block = Some(latest);
+        if outcome == FetchRangeOutcome::ReceiverClosed {
+            return;
+        }
     }
 }
 
@@ -281,5 +338,82 @@ fn extract_l1_block_info(
         timestamp: block.header.timestamp,
         total_blobs,
         base_blobs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FetchRangeOutcome, L1BlockInfo, fetch_contiguous_l1_range};
+    use tokio::sync::mpsc;
+
+    fn block_info(block_number: u64) -> L1BlockInfo {
+        L1BlockInfo { block_number, timestamp: block_number, total_blobs: 0, base_blobs: 0 }
+    }
+
+    #[tokio::test]
+    async fn contiguous_fetch_retries_first_unresolved_block_without_duplicates() {
+        let (result_tx, mut result_rx) = mpsc::channel(4);
+        let mut last_block = Some(100);
+        let mut fail_101_once = true;
+        let mut fetch = |block_number| {
+            let result = if block_number == 101 && fail_101_once {
+                fail_101_once = false;
+                Err("transient RPC failure".to_string())
+            } else {
+                Ok(Some(block_info(block_number)))
+            };
+            std::future::ready(result)
+        };
+
+        let first = fetch_contiguous_l1_range(
+            101,
+            102,
+            &mut last_block,
+            &result_tx,
+            &mut fetch,
+        )
+        .await;
+        assert_eq!(first, FetchRangeOutcome::Retry);
+        assert_eq!(last_block, Some(100));
+        assert!(result_rx.try_recv().is_err());
+
+        let second = fetch_contiguous_l1_range(
+            101,
+            102,
+            &mut last_block,
+            &result_tx,
+            &mut fetch,
+        )
+        .await;
+        assert_eq!(second, FetchRangeOutcome::Complete);
+        assert_eq!(last_block, Some(102));
+        assert_eq!(result_rx.recv().await.unwrap().block_number, 101);
+        assert_eq!(result_rx.recv().await.unwrap().block_number, 102);
+        assert!(result_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unavailable_block_does_not_advance_contiguous_cursor() {
+        let (result_tx, mut result_rx) = mpsc::channel(2);
+        let mut last_block = Some(200);
+
+        let outcome = fetch_contiguous_l1_range(
+            201,
+            202,
+            &mut last_block,
+            &result_tx,
+            |block_number| {
+                std::future::ready(if block_number == 201 {
+                    Ok(None)
+                } else {
+                    Ok(Some(block_info(block_number)))
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, FetchRangeOutcome::Retry);
+        assert_eq!(last_block, Some(200));
+        assert!(result_rx.try_recv().is_err());
     }
 }
