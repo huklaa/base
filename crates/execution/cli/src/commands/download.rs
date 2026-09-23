@@ -159,6 +159,64 @@ fn split_byte_ranges(total: u64, parts: usize) -> Vec<std::ops::Range<u64>> {
     ranges
 }
 
+/// Validates a `206 Partial Content` response and returns its inclusive end offset.
+fn validate_content_range(
+    value: Option<&reqwest::header::HeaderValue>,
+    expected_start: u64,
+    requested_end: u64,
+    expected_total: u64,
+) -> Result<u64> {
+    let value = value
+        .ok_or_else(|| eyre::eyre!("missing Content-Range on HTTP 206 proofs response"))?
+        .to_str()
+        .map_err(|e| eyre::eyre!("invalid Content-Range header: {e}"))?;
+    let spec = value
+        .strip_prefix("bytes ")
+        .ok_or_else(|| eyre::eyre!("invalid Content-Range header: {value}"))?;
+    let (bounds, total) = spec
+        .split_once('/')
+        .ok_or_else(|| eyre::eyre!("invalid Content-Range header: {value}"))?;
+    let (start, end) = bounds
+        .split_once('-')
+        .ok_or_else(|| eyre::eyre!("invalid Content-Range header: {value}"))?;
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| eyre::eyre!("invalid Content-Range header: {value}"))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| eyre::eyre!("invalid Content-Range header: {value}"))?;
+
+    if start > end {
+        eyre::bail!("invalid Content-Range bounds: {value}");
+    }
+    if start != expected_start {
+        eyre::bail!(
+            "proofs Content-Range starts at {start}, expected requested offset {expected_start}"
+        );
+    }
+    if end > requested_end {
+        eyre::bail!(
+            "proofs Content-Range ends at {end}, beyond requested end {requested_end}"
+        );
+    }
+
+    if total != "*" {
+        let total = total
+            .parse::<u64>()
+            .map_err(|_| eyre::eyre!("invalid Content-Range header: {value}"))?;
+        if total != expected_total {
+            eyre::bail!(
+                "proofs Content-Range total is {total}, manifest declares {expected_total} bytes"
+            );
+        }
+        if end >= total {
+            eyre::bail!("invalid Content-Range end {end} for total {total}");
+        }
+    }
+
+    Ok(end)
+}
+
 /// Writes parallel-range resume state next to the `.part` file.
 async fn persist_range_sidecar(
     path: &Path,
@@ -644,7 +702,32 @@ impl ProofsDownloader {
             }
 
             let start_size = if is_resume { existing_size } else { 0 };
+            let response_end = if is_resume {
+                Some(validate_content_range(
+                    response.headers().get(reqwest::header::CONTENT_RANGE),
+                    start_size,
+                    entry.expected_size.saturating_sub(1),
+                    entry.expected_size,
+                )?)
+            } else {
+                None
+            };
+            let response_end_exclusive = response_end
+                .map(|end| {
+                    end.checked_add(1)
+                        .ok_or_else(|| eyre::eyre!("proofs Content-Range end overflow: {end}"))
+                })
+                .transpose()?;
             let content_length = response.content_length();
+            if let (Some(len), Some(end_exclusive)) = (content_length, response_end_exclusive) {
+                let max_response_len = end_exclusive.saturating_sub(start_size);
+                if len > max_response_len {
+                    eyre::bail!(
+                        "proofs resume response body declares {len} bytes for Content-Range {start_size}-{}",
+                        end_exclusive.saturating_sub(1)
+                    );
+                }
+            }
 
             let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
@@ -663,8 +746,17 @@ impl ProofsDownloader {
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        let next_downloaded = downloaded
+                            .checked_add(chunk.len() as u64)
+                            .ok_or_else(|| eyre::eyre!("proofs download offset overflow at {downloaded}"))?;
+                        if response_end_exclusive.is_some_and(|end| next_downloaded > end) {
+                            eyre::bail!(
+                                "proofs resume response body exceeded Content-Range {start_size}-{}",
+                                response_end_exclusive.unwrap_or(start_size).saturating_sub(1)
+                            );
+                        }
                         file.write_all(&chunk).await?;
-                        downloaded += chunk.len() as u64;
+                        downloaded = next_downloaded;
                         if last_log.elapsed() >= PROOFS_PROGRESS_LOG_INTERVAL {
                             log_proofs_download_progress(
                                 downloaded,
@@ -687,9 +779,12 @@ impl ProofsDownloader {
             let downloaded_size = tokio::fs::metadata(&part_path).await?.len();
             let written_this_attempt = downloaded_size.saturating_sub(start_size);
             let entity_complete = stream_error.is_none()
-                && content_length.map_or(downloaded_size == entry.expected_size, |len| {
-                    written_this_attempt >= len
-                });
+                && match response_end_exclusive {
+                    Some(end) => downloaded_size == end,
+                    None => content_length.map_or(downloaded_size == entry.expected_size, |len| {
+                        written_this_attempt >= len
+                    }),
+                };
 
             if !entity_complete {
                 let reason = match (stream_error, content_length) {
@@ -712,6 +807,11 @@ impl ProofsDownloader {
                     &reason,
                 )
                 .await?;
+                continue;
+            }
+
+            if is_resume && downloaded_size < entry.expected_size {
+                idle_attempts = 0;
                 continue;
             }
 
@@ -886,9 +986,10 @@ impl ProofsDownloader {
             }
 
             let abs_start = range.start + already;
+            let requested_end = range.end.saturating_sub(1);
             let response = match client
                 .get(url)
-                .header("Range", format!("bytes={abs_start}-{}", range.end.saturating_sub(1)))
+                .header("Range", format!("bytes={abs_start}-{requested_end}"))
                 .send()
                 .await
             {
@@ -926,7 +1027,24 @@ impl ProofsDownloader {
                 );
             }
 
+            let response_end = validate_content_range(
+                response.headers().get(reqwest::header::CONTENT_RANGE),
+                abs_start,
+                requested_end,
+                range_progress.expected_size,
+            )?;
+            let response_end_exclusive = response_end
+                .checked_add(1)
+                .ok_or_else(|| eyre::eyre!("proofs Content-Range end overflow: {response_end}"))?;
+            let max_response_len = response_end_exclusive.saturating_sub(abs_start);
             let content_length = response.content_length();
+            if content_length.is_some_and(|len| len > max_response_len) {
+                eyre::bail!(
+                    "proofs range response body declares {len} bytes for Content-Range {abs_start}-{response_end}",
+                    len = content_length.unwrap_or(0)
+                );
+            }
+
             let mut file = tokio::fs::OpenOptions::new().write(true).open(part_path).await?;
             file.seek(SeekFrom::Start(abs_start)).await?;
 
@@ -936,8 +1054,16 @@ impl ProofsDownloader {
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        let next_offset = offset.checked_add(chunk.len() as u64).ok_or_else(|| {
+                            eyre::eyre!("proofs range response offset overflow at {offset}")
+                        })?;
+                        if next_offset > response_end_exclusive {
+                            eyre::bail!(
+                                "proofs range response body exceeded Content-Range {abs_start}-{response_end}"
+                            );
+                        }
                         file.write_all(&chunk).await?;
-                        offset += chunk.len() as u64;
+                        offset = next_offset;
                         range_progress.progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                     }
                     Err(error) => {
@@ -1239,12 +1365,18 @@ mod tests {
                 Ok::<_, std::io::Error>(first),
                 Err(std::io::Error::other("error decoding response body")),
             ]));
-            let status = if headers.get("Range").is_some() {
-                StatusCode::PARTIAL_CONTENT
-            } else {
-                StatusCode::OK
-            };
-            return (status, body).into_response();
+            if headers.get("Range").is_some() {
+                return (
+                    StatusCode::PARTIAL_CONTENT,
+                    [(
+                        axum::http::header::CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{}", state.data.len()),
+                    )],
+                    body,
+                )
+                    .into_response();
+            }
+            return (StatusCode::OK, body).into_response();
         }
 
         (
@@ -1446,6 +1578,41 @@ mod tests {
         let ranges = split_byte_ranges(3, 8);
 
         assert_eq!(ranges, vec![0..1, 1..2, 2..3], "cannot split into more streams than bytes");
+    }
+
+    #[test]
+    fn content_range_validation_accepts_shorter_partial_response() {
+        let header = reqwest::header::HeaderValue::from_static("bytes 10-14/100");
+        assert_eq!(validate_content_range(Some(&header), 10, 19, 100).unwrap(), 14);
+    }
+
+    #[test]
+    fn content_range_validation_accepts_unknown_total() {
+        let header = reqwest::header::HeaderValue::from_static("bytes 10-19/*");
+        assert_eq!(validate_content_range(Some(&header), 10, 19, 100).unwrap(), 19);
+    }
+
+    #[test]
+    fn content_range_validation_rejects_missing_header() {
+        assert!(validate_content_range(None, 10, 19, 100).is_err());
+    }
+
+    #[test]
+    fn content_range_validation_rejects_mismatched_start() {
+        let header = reqwest::header::HeaderValue::from_static("bytes 11-19/100");
+        assert!(validate_content_range(Some(&header), 10, 19, 100).is_err());
+    }
+
+    #[test]
+    fn content_range_validation_rejects_end_beyond_request() {
+        let header = reqwest::header::HeaderValue::from_static("bytes 10-20/100");
+        assert!(validate_content_range(Some(&header), 10, 19, 100).is_err());
+    }
+
+    #[test]
+    fn content_range_validation_rejects_total_mismatch() {
+        let header = reqwest::header::HeaderValue::from_static("bytes 10-19/101");
+        assert!(validate_content_range(Some(&header), 10, 19, 100).is_err());
     }
 
     #[test]
@@ -1780,6 +1947,69 @@ mod tests {
 
         assert_eq!(downloaded.len(), archive.len(), "resumed download should produce full archive");
         assert_eq!(downloaded, archive, "resumed archive should match original byte-for-byte");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn download_archive_sequential_rejects_mismatched_content_range_start() {
+        let archive = create_proofs_archive(&[("proofs/data.mdb", b"mismatched-resume-range")]);
+        let half = archive.len() / 2;
+        assert!(half > 0 && half < archive.len());
+
+        let data = archive.clone();
+        let app = Router::new().route(
+            "/proofs.tar.zst",
+            get(move |headers: HeaderMap| {
+                let data = data.clone();
+                async move {
+                    if let Some((start, _)) = parse_byte_range(&headers, data.len()) {
+                        let body_len = data.len().saturating_sub(start);
+                        let wrong_end = body_len.saturating_sub(1);
+                        return (
+                            StatusCode::PARTIAL_CONTENT,
+                            [(
+                                axum::http::header::CONTENT_RANGE,
+                                format!("bytes 0-{wrong_end}/{}", data.len()),
+                            )],
+                            data[..body_len].to_vec(),
+                        )
+                            .into_response();
+                    }
+                    (StatusCode::OK, data).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let part_path = cache_dir.path().join("proofs.tar.zst.part");
+        std::fs::write(&part_path, &archive[..half]).unwrap();
+
+        let entry = ProofsManifestEntry {
+            file_name: "proofs.tar.zst".to_string(),
+            expected_size: archive.len() as u64,
+            archive_url: format!("{base_url}/proofs.tar.zst"),
+        };
+
+        let result = ProofsDownloader::download_archive(&entry, cache_dir.path(), 1).await;
+        assert!(result.is_err(), "mismatched sequential Content-Range must fail closed");
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("Content-Range starts at 0")
+                && error.contains(&format!("expected requested offset {half}")),
+            "error should identify the mismatched resume start, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&part_path).unwrap(),
+            archive[..half],
+            "invalid 206 response must be rejected before appending to the .part file"
+        );
 
         handle.abort();
     }
