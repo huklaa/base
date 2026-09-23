@@ -125,14 +125,10 @@ impl P2pCommand {
             P2pCommands::UnbanAll(args) => run_unban_all(config, args).await,
             P2pCommands::Peers(args) => run_peers(config, args).await.map(|()| success),
             P2pCommands::Info(args) => run_info(config, args).await.map(|()| success),
-            P2pCommands::AddPeer(args) => run_add_peer(config, args).await.map(|()| success),
-            P2pCommands::RemovePeer(args) => run_remove_peer(config, args).await.map(|()| success),
-            P2pCommands::Ban(args) => {
-                run_peer_ban_action(config, args, BanAction::Ban).await.map(|()| success)
-            }
-            P2pCommands::Unban(args) => {
-                run_peer_ban_action(config, args, BanAction::Unban).await.map(|()| success)
-            }
+            P2pCommands::AddPeer(args) => run_add_peer(config, args).await,
+            P2pCommands::RemovePeer(args) => run_remove_peer(config, args).await,
+            P2pCommands::Ban(args) => run_peer_ban_action(config, args, BanAction::Ban).await,
+            P2pCommands::Unban(args) => run_peer_ban_action(config, args, BanAction::Unban).await,
         }
     }
 }
@@ -228,7 +224,10 @@ async fn run_peers(config: MonitoringConfig, args: P2pArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_add_peer(config: MonitoringConfig, args: DestructivePeerArgs) -> Result<()> {
+async fn run_add_peer(
+    config: MonitoringConfig,
+    args: DestructivePeerArgs,
+) -> Result<CommandOutcome> {
     let DestructivePeerArgs { target, el_rpc: el_rpc_override, cl_rpc: cl_rpc_override, yes, json } =
         args;
     let target = AddTarget::parse(&target)?;
@@ -244,13 +243,14 @@ async fn run_add_peer(config: MonitoringConfig, args: DestructivePeerArgs) -> Re
             let el_rpc = el_rpc_override.unwrap_or_else(|| config.rpc.clone());
             let prompt = format!("Add EL peer {enode} through {el_rpc}? [y/N] ");
             if !Confirm::prompt_or_abort(&prompt, yes)? {
-                return Ok(());
+                return Ok(CommandOutcome::Success);
             }
             let accepted = add_peer(&el_rpc, &enode).await?;
             print_peer_action(
                 &PeerActionJson::el(&config.name, PeerAction::Add, enode, accepted),
                 json,
             )?;
+            return Ok(el_peer_action_outcome(accepted));
         }
         AddTarget::Multiaddr(multiaddr) => {
             warn_ignored_rpc_override(
@@ -262,17 +262,20 @@ async fn run_add_peer(config: MonitoringConfig, args: DestructivePeerArgs) -> Re
             let cl_rpc = config.resolve_cl_rpc(cl_rpc_override.as_ref(), "p2p add-peer")?;
             let prompt = format!("Connect CL peer {multiaddr} through {cl_rpc}? [y/N] ");
             if !Confirm::prompt_or_abort(&prompt, yes)? {
-                return Ok(());
+                return Ok(CommandOutcome::Success);
             }
             connect_peer(&cl_rpc, &multiaddr).await?;
             print_peer_action(&PeerActionJson::cl(&config.name, PeerAction::Add, multiaddr), json)?;
         }
     }
 
-    Ok(())
+    Ok(CommandOutcome::Success)
 }
 
-async fn run_remove_peer(config: MonitoringConfig, args: DestructivePeerArgs) -> Result<()> {
+async fn run_remove_peer(
+    config: MonitoringConfig,
+    args: DestructivePeerArgs,
+) -> Result<CommandOutcome> {
     let DestructivePeerArgs { target, el_rpc: el_rpc_override, cl_rpc: cl_rpc_override, yes, json } =
         args;
     let target = PeerTarget::parse(&target)?;
@@ -288,13 +291,14 @@ async fn run_remove_peer(config: MonitoringConfig, args: DestructivePeerArgs) ->
             let el_rpc = el_rpc_override.unwrap_or_else(|| config.rpc.clone());
             let prompt = format!("Remove EL peer {enode} through {el_rpc}? [y/N] ");
             if !Confirm::prompt_or_abort(&prompt, yes)? {
-                return Ok(());
+                return Ok(CommandOutcome::Success);
             }
             let accepted = remove_peer(&el_rpc, &enode).await?;
             print_peer_action(
                 &PeerActionJson::el(&config.name, PeerAction::Remove, enode, accepted),
                 json,
             )?;
+            return Ok(el_peer_action_outcome(accepted));
         }
         PeerTarget::PeerId(peer_id) => {
             warn_ignored_rpc_override(
@@ -306,7 +310,7 @@ async fn run_remove_peer(config: MonitoringConfig, args: DestructivePeerArgs) ->
             let cl_rpc = config.resolve_cl_rpc(cl_rpc_override.as_ref(), "p2p remove-peer")?;
             let prompt = format!("Disconnect CL peer {peer_id} from {cl_rpc}? [y/N] ");
             if !Confirm::prompt_or_abort(&prompt, yes)? {
-                return Ok(());
+                return Ok(CommandOutcome::Success);
             }
             disconnect_peer(&cl_rpc, &peer_id).await?;
             print_peer_action(
@@ -316,14 +320,14 @@ async fn run_remove_peer(config: MonitoringConfig, args: DestructivePeerArgs) ->
         }
     }
 
-    Ok(())
+    Ok(CommandOutcome::Success)
 }
 
 async fn run_peer_ban_action(
     config: MonitoringConfig,
     args: DestructivePeerArgs,
     action: BanAction,
-) -> Result<()> {
+) -> Result<CommandOutcome> {
     let DestructivePeerArgs { target, el_rpc: el_rpc_override, cl_rpc: cl_rpc_override, yes, json } =
         args;
     let (verb, command_name) = match action {
@@ -344,7 +348,7 @@ async fn run_peer_ban_action(
             }
             let prompt = format!("{verb} EL peer {enode} through {el_rpc}? [y/N] ");
             if !Confirm::prompt_or_abort(&prompt, yes)? {
-                return Ok(());
+                return Ok(CommandOutcome::Success);
             }
             let accepted = match action {
                 BanAction::Ban => ban_el_peer(&el_rpc, &enode).await?,
@@ -354,6 +358,7 @@ async fn run_peer_ban_action(
                 &PeerActionJson::el(&config.name, action.peer_action(), enode, accepted),
                 json,
             )?;
+            return Ok(el_peer_action_outcome(accepted));
         }
         PeerTarget::PeerId(peer_id) => {
             warn_ignored_rpc_override(
@@ -365,7 +370,7 @@ async fn run_peer_ban_action(
             let cl_rpc = config.resolve_cl_rpc(cl_rpc_override.as_ref(), command_name)?;
             let prompt = format!("{verb} CL peer {peer_id} through {cl_rpc}? [y/N] ");
             if !Confirm::prompt_or_abort(&prompt, yes)? {
-                return Ok(());
+                return Ok(CommandOutcome::Success);
             }
             let disconnect_error = match action {
                 BanAction::Ban => {
@@ -388,7 +393,7 @@ async fn run_peer_ban_action(
             )?;
         }
     }
-    Ok(())
+    Ok(CommandOutcome::Success)
 }
 
 async fn run_unban_all(
@@ -741,6 +746,10 @@ impl PeerBulkActionResultJson {
     }
 }
 
+const fn el_peer_action_outcome(accepted: bool) -> CommandOutcome {
+    CommandOutcome::from_failures(!accepted)
+}
+
 fn print_peer_action(action: &PeerActionJson, json: bool) -> Result<()> {
     if json {
         JsonOutput::print(action)?;
@@ -757,28 +766,28 @@ fn print_peer_action_pretty(action: &PeerActionJson) -> Result<()> {
             if *accepted {
                 writeln!(stdout, "OK EL accepted peer {target}")?;
             } else {
-                writeln!(stdout, "OK EL did not accept peer {target}")?;
+                writeln!(stdout, "FAILED EL did not accept peer {target}")?;
             }
         }
         PeerActionJson::El { action: PeerAction::Remove, target, accepted, .. } => {
             if *accepted {
                 writeln!(stdout, "OK EL removed peer {target}")?;
             } else {
-                writeln!(stdout, "OK EL did not remove peer {target}")?;
+                writeln!(stdout, "FAILED EL did not remove peer {target}")?;
             }
         }
         PeerActionJson::El { action: PeerAction::Ban, target, accepted, .. } => {
             if *accepted {
                 writeln!(stdout, "OK EL accepted ban for peer {target}")?;
             } else {
-                writeln!(stdout, "OK EL did not accept ban for peer {target}")?;
+                writeln!(stdout, "FAILED EL did not accept ban for peer {target}")?;
             }
         }
         PeerActionJson::El { action: PeerAction::Unban, target, accepted, .. } => {
             if *accepted {
                 writeln!(stdout, "OK EL accepted unban for peer {target}")?;
             } else {
-                writeln!(stdout, "OK EL did not accept unban for peer {target}")?;
+                writeln!(stdout, "FAILED EL did not accept unban for peer {target}")?;
             }
         }
         PeerActionJson::Cl { action: PeerAction::Add, target, .. } => {
@@ -876,8 +885,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        AddTarget, PeerAction, PeerActionJson, PeerBulkAction, PeerBulkActionResultJson,
-        PeerTarget, run_reachability,
+        AddTarget, PeerAction, PeerActionJson, PeerBulkAction, PeerBulkActionResultJson, PeerTarget,
+        el_peer_action_outcome, run_reachability,
     };
     use crate::{MonitoringConfig, P2pTargetError};
 
@@ -1093,6 +1102,12 @@ mod tests {
                 .unwrap_err(),
             P2pTargetError::TargetContainsWhitespace { .. }
         ));
+    }
+
+    #[test]
+    fn el_peer_action_outcome_fails_rejected_actions() {
+        assert!(!el_peer_action_outcome(true).has_failures());
+        assert!(el_peer_action_outcome(false).has_failures());
     }
 
     #[test]
