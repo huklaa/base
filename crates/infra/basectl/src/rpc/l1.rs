@@ -132,6 +132,10 @@ fn http_to_ws(url: &str) -> String {
     url.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1)
 }
 
+fn next_unprocessed_block(last_block: Option<u64>, observed_block: u64) -> u64 {
+    last_block.map_or(observed_block, |last| last.saturating_add(1))
+}
+
 /// Watches L1 blocks for blob transactions, preferring WebSocket with polling fallback.
 pub async fn run_l1_blob_watcher(
     l1_rpc: String,
@@ -184,30 +188,31 @@ async fn run_l1_blob_watcher_ws(
 
     while let Some(header) = stream.next().await {
         let block_num = header.number;
+        let start = next_unprocessed_block(last_block, block_num);
 
-        let start = last_block.map_or(block_num, |last| last + 1);
-        for gap_num in start..block_num {
-            if let Ok(Some(block)) =
-                provider.get_block_by_number(BlockNumberOrTag::Number(gap_num)).full().await
+        for next_block in start..=block_num {
+            let block = match provider
+                .get_block_by_number(BlockNumberOrTag::Number(next_block))
+                .full()
+                .await
             {
-                let info = extract_l1_block_info(&block, batcher_address);
-                if result_tx.send(info).await.is_err() {
-                    return Ok(());
+                Ok(Some(block)) => block,
+                Ok(None) => {
+                    warn!(block_number = next_block, "L1 block not available yet; will retry");
+                    break;
                 }
-            }
-        }
+                Err(e) => {
+                    warn!(error = %e, block_number = next_block, "Failed to fetch L1 block; will retry");
+                    break;
+                }
+            };
 
-        if block_num > last_block.unwrap_or(0)
-            && let Ok(Some(block)) =
-                provider.get_block_by_number(BlockNumberOrTag::Number(block_num)).full().await
-        {
             let info = extract_l1_block_info(&block, batcher_address);
             if result_tx.send(info).await.is_err() {
                 return Ok(());
             }
+            last_block = Some(next_block);
         }
-
-        last_block = Some(block_num);
     }
 
     warn!("L1 WebSocket stream ended");
@@ -242,20 +247,31 @@ async fn run_l1_blob_watcher_poll(
             Err(_) => continue,
         };
 
-        let start_block = last_block.map_or(latest, |b| b + 1);
+        let start_block = next_unprocessed_block(last_block, latest);
 
         for block_num in start_block..=latest {
-            if let Ok(Some(block)) =
-                provider.get_block_by_number(BlockNumberOrTag::Number(block_num)).full().await
+            let block = match provider
+                .get_block_by_number(BlockNumberOrTag::Number(block_num))
+                .full()
+                .await
             {
-                let info = extract_l1_block_info(&block, batcher_address);
-                if result_tx.send(info).await.is_err() {
-                    return;
+                Ok(Some(block)) => block,
+                Ok(None) => {
+                    warn!(block_number = block_num, "L1 block not available yet; will retry");
+                    break;
                 }
-            }
-        }
+                Err(e) => {
+                    warn!(error = %e, block_number = block_num, "Failed to fetch L1 block; will retry");
+                    break;
+                }
+            };
 
-        last_block = Some(latest);
+            let info = extract_l1_block_info(&block, batcher_address);
+            if result_tx.send(info).await.is_err() {
+                return;
+            }
+            last_block = Some(block_num);
+        }
     }
 }
 
@@ -281,5 +297,24 @@ fn extract_l1_block_info(
         timestamp: block.header.timestamp,
         total_blobs,
         base_blobs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_unprocessed_block;
+
+    #[test]
+    fn starts_from_observed_block_without_a_cursor() {
+        assert_eq!(next_unprocessed_block(None, 42), 42);
+    }
+
+    #[test]
+    fn failed_fetch_keeps_the_same_unprocessed_block_for_retry() {
+        let last_processed = Some(10);
+
+        assert_eq!(next_unprocessed_block(last_processed, 12), 11);
+        // Simulate block 11 failing to fetch: the contiguous cursor is intentionally unchanged.
+        assert_eq!(next_unprocessed_block(last_processed, 13), 11);
     }
 }
