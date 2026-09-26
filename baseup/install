@@ -35,11 +35,9 @@ ensure_writable_destination() {
     local dst="$1"
     local parent
 
-    if [[ -e "$dst" ]]; then
-        [[ -w "$dst" ]] && return
-    else
-        parent="$(dirname "$dst")"
-        [[ -w "$parent" ]] && return
+    parent="$(dirname "$dst")"
+    if [[ -w "$parent" && -x "$parent" ]]; then
+        return
     fi
 
     error "destination $dst is not writable; choose a user-writable BASE_BIN_DIR"
