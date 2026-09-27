@@ -139,18 +139,23 @@ struct RawBlockInfo {
 
 /// Fetches a single L2 block and computes its DA bytes.
 ///
-/// Returns `None` if the RPC call fails or the block does not exist.
+/// RPC failures and missing blocks are returned as errors so callers can decide
+/// whether to retry, skip, or fail the surrounding operation.
 async fn fetch_raw_block_info<P: Provider<Base>>(
     provider: &P,
     block_num: u64,
-) -> Option<RawBlockInfo> {
-    let block =
-        provider.get_block_by_number(BlockNumberOrTag::Number(block_num)).full().await.ok()??;
+) -> Result<RawBlockInfo> {
+    let block = provider
+        .get_block_by_number(BlockNumberOrTag::Number(block_num))
+        .full()
+        .await
+        .with_context(|| format!("fetching L2 block {block_num}"))?
+        .ok_or_else(|| anyhow!("L2 block {block_num} not found"))?;
 
     let da_bytes: u64 =
         block.transactions.txns().map(|tx| tx.inner.inner.encode_2718_len() as u64).sum();
 
-    Some(RawBlockInfo { da_bytes, timestamp: block.header.timestamp })
+    Ok(RawBlockInfo { da_bytes, timestamp: block.header.timestamp })
 }
 
 /// Fetches DA info for requested block numbers and sends results back.
@@ -175,16 +180,22 @@ pub async fn run_block_fetcher(
     };
 
     while let Some(block_num) = request_rx.recv().await {
-        if let Some(info) = fetch_raw_block_info(&provider, block_num).await {
-            let block_info = BlockDaInfo {
-                block_number: block_num,
-                da_bytes: info.da_bytes,
-                timestamp: info.timestamp,
-            };
-
-            if result_tx.send(block_info).await.is_err() {
-                break;
+        let info = match fetch_raw_block_info(&provider, block_num).await {
+            Ok(info) => info,
+            Err(e) => {
+                warn!(error = %e, block = block_num, "failed to fetch block DA info");
+                continue;
             }
+        };
+
+        let block_info = BlockDaInfo {
+            block_number: block_num,
+            da_bytes: info.da_bytes,
+            timestamp: info.timestamp,
+        };
+
+        if result_tx.send(block_info).await.is_err() {
+            break;
         }
     }
 }
@@ -220,19 +231,18 @@ pub async fn fetch_initial_backlog_with_progress(
             .map(|block_num| {
                 let provider = Arc::clone(&provider);
                 async move {
-                    fetch_raw_block_info(&*provider, block_num).await.map_or(
-                        BacklogBlock { block_number: block_num, da_bytes: 0, timestamp: 0 },
-                        |info| BacklogBlock {
-                            block_number: block_num,
-                            da_bytes: info.da_bytes,
-                            timestamp: info.timestamp,
-                        },
-                    )
+                    let info = fetch_raw_block_info(&*provider, block_num).await?;
+                    Ok::<_, anyhow::Error>(BacklogBlock {
+                        block_number: block_num,
+                        da_bytes: info.da_bytes,
+                        timestamp: info.timestamp,
+                    })
                 }
             })
             .buffer_unordered(CONCURRENT_BLOCK_FETCHES);
 
         while let Some(block) = fetch_stream.next().await {
+            let block = block?;
             total_da_bytes = total_da_bytes.saturating_add(block.da_bytes);
             blocks.push(block);
             blocks_fetched += 1;
@@ -383,7 +393,11 @@ pub async fn fetch_block_transactions(
 
 #[cfg(test)]
 mod tests {
-    use super::effective_priority_fee_per_gas;
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+    use base_common_network::Base;
+
+    use super::{effective_priority_fee_per_gas, fetch_raw_block_info};
 
     #[test]
     fn priority_fee_uses_effective_gas_price_when_base_fee_known() {
@@ -398,5 +412,29 @@ mod tests {
     #[test]
     fn priority_fee_is_unknown_for_legacy_txs_when_base_fee_unknown() {
         assert_eq!(effective_priority_fee_per_gas(None, 125, None), None);
+    }
+
+    #[tokio::test]
+    async fn raw_block_fetch_surfaces_rpc_failure() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("boom");
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .network::<Base>()
+            .connect_mocked_client(asserter);
+
+        assert!(fetch_raw_block_info(&provider, 42).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_block_fetch_rejects_missing_block() {
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::Null);
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .network::<Base>()
+            .connect_mocked_client(asserter);
+
+        assert!(fetch_raw_block_info(&provider, 42).await.is_err());
     }
 }
