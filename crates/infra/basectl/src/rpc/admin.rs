@@ -3,7 +3,11 @@ use std::time::Duration;
 use alloy_primitives::B256;
 use anyhow::{Context, Result, ensure};
 use base_consensus_rpc::{AdminApiClient, BaseP2PApiClient};
-use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
+use jsonrpsee::{
+    core::client::ClientT,
+    http_client::{HttpClient, HttpClientBuilder},
+    rpc_params,
+};
 use tokio::sync::mpsc;
 use tracing::warn;
 use url::Url;
@@ -108,8 +112,37 @@ pub async fn stop_sequencer_node(
     let _ = result_tx.send(outcome.map_err(|e| e.to_string())).await;
 }
 
+async fn restore_peer_snapshot(
+    cl_client: &HttpClient,
+    cl_addrs: &[String],
+    el_client: Option<&HttpClient>,
+    el_enodes: &[String],
+) {
+    for addr in cl_addrs {
+        if let Err(error) = BaseP2PApiClient::opp2p_connect_peer(cl_client, addr.clone()).await {
+            warn!(peer = %addr, %error, "failed to restore CL peer after P2P isolation failure");
+        }
+    }
+
+    if let Some(el_client) = el_client {
+        for enode in el_enodes {
+            let result: Result<bool, _> =
+                ClientT::request(el_client, "admin_addPeer", rpc_params![enode]).await;
+            match result {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(peer = %enode, "EL rejected peer restore after P2P isolation failure");
+                }
+                Err(error) => {
+                    warn!(peer = %enode, %error, "failed to restore EL peer after P2P isolation failure");
+                }
+            }
+        }
+    }
+}
+
 /// Disconnects all p2p peers from the CL and EL of a node so that neither layer
-/// can advance.  Returns the saved peer addresses so they can be restored later
+/// can advance. Returns the saved peer addresses so they can be restored later
 /// via [`unpause_sequencer_node`].
 pub async fn pause_sequencer_node(
     node: ConductorNodeConfig,
@@ -123,37 +156,89 @@ pub async fn pause_sequencer_node(
             .build(node.cl_rpc.as_str())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // Snapshot connected CL peers before disconnecting so we can restore them.
+        // Snapshot every reconnect target before mutating either layer. If a peer cannot be
+        // restored later, fail before disconnecting anything rather than creating partial state.
         let dump = BaseP2PApiClient::opp2p_peers(&cl_client, true)
             .await
             .map_err(|e| anyhow::anyhow!("opp2p_peers: {e}"))?;
-
-        let mut cl_addrs = Vec::new();
+        let mut cl_peers = Vec::with_capacity(dump.peers.len());
         for (peer_id, info) in dump.peers {
-            let _ = BaseP2PApiClient::opp2p_disconnect_peer(&cl_client, peer_id).await;
-            if let Some(addr) = info.addresses.into_iter().next() {
-                cl_addrs.push(addr);
-            }
+            let addr = info
+                .addresses
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("connected CL peer {peer_id} has no reconnectable address"))?;
+            cl_peers.push((peer_id, addr));
         }
 
-        // Remove EL peers (best-effort; skip if EL not configured).
-        let mut el_enodes = Vec::new();
-        if let Some(ref el_rpc) = node.el_rpc {
-            let el_client = HttpClientBuilder::default()
+        let (el_client, el_enodes) = if let Some(ref el_rpc) = node.el_rpc {
+            let client = HttpClientBuilder::default()
                 .request_timeout(TIMEOUT)
                 .build(el_rpc.as_str())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let peers: Vec<serde_json::Value> = ClientT::request(&client, "admin_peers", rpc_params![])
+                .await
+                .map_err(|e| anyhow::anyhow!("admin_peers: {e}"))?;
+            let mut enodes = Vec::with_capacity(peers.len());
+            for peer in peers {
+                let enode = peer
+                    .get("enode")
+                    .and_then(|value| value.as_str())
+                    .filter(|enode| !enode.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("admin_peers returned a peer without an enode"))?;
+                enodes.push(enode.to_string());
+            }
+            (Some(client), enodes)
+        } else {
+            (None, Vec::new())
+        };
 
-            let peers: Vec<serde_json::Value> =
-                ClientT::request(&el_client, "admin_peers", rpc_params![])
-                    .await
-                    .unwrap_or_default();
+        let mut disconnected_cl_addrs = Vec::with_capacity(cl_peers.len());
+        for (peer_id, addr) in &cl_peers {
+            if let Err(error) = BaseP2PApiClient::opp2p_disconnect_peer(&cl_client, peer_id.clone()).await
+            {
+                // The RPC error may be ambiguous about whether the current peer was already
+                // disconnected, so include it in the best-effort restore set too.
+                let mut restore_addrs = disconnected_cl_addrs;
+                restore_addrs.push(addr.clone());
+                restore_peer_snapshot(&cl_client, &restore_addrs, None, &[]).await;
+                anyhow::bail!("opp2p_disconnectPeer failed for {peer_id}: {error}");
+            }
+            disconnected_cl_addrs.push(addr.clone());
+        }
 
-            for peer in &peers {
-                if let Some(enode) = peer.get("enode").and_then(|v| v.as_str()) {
-                    let _: Result<bool, _> =
-                        ClientT::request(&el_client, "admin_removePeer", rpc_params![enode]).await;
-                    el_enodes.push(enode.to_string());
+        let cl_addrs = disconnected_cl_addrs;
+        let mut removed_el_enodes = Vec::with_capacity(el_enodes.len());
+        if let Some(ref client) = el_client {
+            for enode in &el_enodes {
+                let result: Result<bool, _> =
+                    ClientT::request(client, "admin_removePeer", rpc_params![enode]).await;
+                match result {
+                    Ok(true) => removed_el_enodes.push(enode.clone()),
+                    Ok(false) => {
+                        restore_peer_snapshot(
+                            &cl_client,
+                            &cl_addrs,
+                            Some(client),
+                            &removed_el_enodes,
+                        )
+                        .await;
+                        anyhow::bail!("admin_removePeer rejected {enode}");
+                    }
+                    Err(error) => {
+                        // As with CL disconnects, an RPC error can be ambiguous about whether the
+                        // mutation took effect. Include the current peer in the restore attempt.
+                        let mut restore_enodes = removed_el_enodes;
+                        restore_enodes.push(enode.clone());
+                        restore_peer_snapshot(
+                            &cl_client,
+                            &cl_addrs,
+                            Some(client),
+                            &restore_enodes,
+                        )
+                        .await;
+                        anyhow::bail!("admin_removePeer failed for {enode}: {error}");
+                    }
                 }
             }
         }
