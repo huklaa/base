@@ -463,28 +463,32 @@ async fn find_latest_proposal<P: Provider + Clone>(
     let scan_end = count.saturating_sub(50);
 
     for idx in (scan_end..=scan_start).rev() {
-        let Ok(game) = factory.gameAtIndex(alloy_primitives::U256::from(idx)).call().await else {
-            continue;
-        };
+        let game = factory
+            .gameAtIndex(alloy_primitives::U256::from(idx))
+            .call()
+            .await
+            .ok()?;
 
         if game.gameType != game_type {
             continue;
         }
 
-        // Found a matching game — query its details.
+        // Found a matching game — query its details. Any failed detail read means
+        // the proposal is incomplete, so fail closed rather than fabricating zeros.
         let verifier = IAggregateVerifier::new(game.proxy, l1_provider);
 
-        let (root_claim, l2_seq, status) = tokio::join!(
-            async { verifier.rootClaim().call().await.ok() },
-            async { verifier.l2SequenceNumber().call().await.ok() },
-            async { verifier.status().call().await.ok() },
-        );
+        let (root_claim, l2_seq, status) = tokio::try_join!(
+            async { verifier.rootClaim().call().await },
+            async { verifier.l2SequenceNumber().call().await },
+            async { verifier.status().call().await },
+        )
+        .ok()?;
 
         return Some(LatestProposal {
             game_address: game.proxy,
-            l2_block: l2_seq.and_then(|s| s.try_into().ok()).unwrap_or(0),
-            root_claim: root_claim.unwrap_or_default(),
-            status: status.unwrap_or(0),
+            l2_block: l2_seq.try_into().ok()?,
+            root_claim,
+            status,
             created_at: game.timestamp,
         });
     }
@@ -542,5 +546,119 @@ pub async fn run_rollup_config_poller(
             let _ = toast_tx.try_send(Toast::info("Upgrade schedule updated"));
         }
         last_upgrades = Some(config.upgrades);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{Address, B256, Bytes, U256};
+    use alloy_provider::RootProvider;
+    use alloy_rpc_client::RpcClient;
+    use alloy_sol_types::SolValue;
+    use alloy_transport::mock::Asserter;
+
+    use super::{IDisputeGameFactory, find_latest_proposal};
+
+    fn push_abi<T: SolValue>(asserter: &Asserter, value: &T) {
+        asserter.push_success(&Bytes::from(value.abi_encode()));
+    }
+
+    fn push_game(asserter: &Asserter, game_type: u32, timestamp: u64, proxy: Address) {
+        push_abi(asserter, &(game_type, timestamp, proxy));
+    }
+
+    fn push_details(asserter: &Asserter, root: B256, l2_block: u64, status: u8) {
+        push_abi(asserter, &root);
+        push_abi(asserter, &U256::from(l2_block));
+        push_abi(asserter, &status);
+    }
+
+    #[tokio::test]
+    async fn latest_proposal_does_not_fall_back_after_newer_game_read_failure() {
+        let asserter = Asserter::new();
+        let provider = RootProvider::new(RpcClient::mocked(asserter.clone()));
+        let factory = IDisputeGameFactory::new(Address::repeat_byte(0xF0), &provider);
+        let older_game = Address::repeat_byte(0x11);
+
+        asserter.push_failure_msg("RPC unavailable");
+        push_game(&asserter, 2, 1_700_000_000, older_game);
+        push_details(&asserter, B256::repeat_byte(0x22), 1234, 0);
+
+        let proposal = find_latest_proposal(&factory, &provider, Some(2), Some(2)).await;
+
+        assert!(proposal.is_none());
+    }
+
+    #[tokio::test]
+    async fn latest_proposal_fails_closed_on_root_claim_failure() {
+        let asserter = Asserter::new();
+        let provider = RootProvider::new(RpcClient::mocked(asserter.clone()));
+        let factory = IDisputeGameFactory::new(Address::repeat_byte(0xF0), &provider);
+        let game = Address::repeat_byte(0x11);
+
+        push_game(&asserter, 2, 1_700_000_000, game);
+        asserter.push_failure_msg("rootClaim unavailable");
+        push_abi(&asserter, &U256::from(1234));
+        push_abi(&asserter, &0_u8);
+
+        let proposal = find_latest_proposal(&factory, &provider, Some(2), Some(1)).await;
+
+        assert!(proposal.is_none());
+    }
+
+    #[tokio::test]
+    async fn latest_proposal_fails_closed_on_l2_sequence_number_failure() {
+        let asserter = Asserter::new();
+        let provider = RootProvider::new(RpcClient::mocked(asserter.clone()));
+        let factory = IDisputeGameFactory::new(Address::repeat_byte(0xF0), &provider);
+        let game = Address::repeat_byte(0x11);
+
+        push_game(&asserter, 2, 1_700_000_000, game);
+        push_abi(&asserter, &B256::repeat_byte(0x22));
+        asserter.push_failure_msg("l2SequenceNumber unavailable");
+        push_abi(&asserter, &0_u8);
+
+        let proposal = find_latest_proposal(&factory, &provider, Some(2), Some(1)).await;
+
+        assert!(proposal.is_none());
+    }
+
+    #[tokio::test]
+    async fn latest_proposal_fails_closed_on_status_failure() {
+        let asserter = Asserter::new();
+        let provider = RootProvider::new(RpcClient::mocked(asserter.clone()));
+        let factory = IDisputeGameFactory::new(Address::repeat_byte(0xF0), &provider);
+        let game = Address::repeat_byte(0x11);
+
+        push_game(&asserter, 2, 1_700_000_000, game);
+        push_abi(&asserter, &B256::repeat_byte(0x22));
+        push_abi(&asserter, &U256::from(1234));
+        asserter.push_failure_msg("status unavailable");
+
+        let proposal = find_latest_proposal(&factory, &provider, Some(2), Some(1)).await;
+
+        assert!(proposal.is_none());
+    }
+
+    #[tokio::test]
+    async fn latest_proposal_returns_complete_matching_game() {
+        let asserter = Asserter::new();
+        let provider = RootProvider::new(RpcClient::mocked(asserter.clone()));
+        let factory = IDisputeGameFactory::new(Address::repeat_byte(0xF0), &provider);
+        let game = Address::repeat_byte(0x11);
+        let root = B256::repeat_byte(0x22);
+
+        push_game(&asserter, 2, 1_700_000_000, game);
+        push_details(&asserter, root, 1234, 2);
+
+        let proposal = find_latest_proposal(&factory, &provider, Some(2), Some(1))
+            .await
+            .expect("complete matching proposal should be returned");
+
+        assert_eq!(proposal.game_address, game);
+        assert_eq!(proposal.l2_block, 1234);
+        assert_eq!(proposal.root_claim, root);
+        assert_eq!(proposal.status, 2);
+        assert_eq!(proposal.created_at, 1_700_000_000);
     }
 }
