@@ -1,0 +1,118 @@
+name: Verify gnark Go proxy backport
+
+on:
+  push:
+    branches: [verify-gnark-go-proxy]
+    paths: [.github/workflows/verify-gnark-go-proxy.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  gnark-go-archive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GOSUMDB: sum.golang.org
+      GOFLAGS: -mod=readonly
+      GIT_TERMINAL_PROMPT: '0'
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: d460e82562a69561f3acf6bbad35d2a89601659e
+          persist-credentials: false
+
+      - name: Prepare checksum-verified published SP1 crate and Cargo probe
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = d460e82562a69561f3acf6bbad35d2a89601659e
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import os
+          from pathlib import Path
+          import tarfile
+          import tomllib
+          import urllib.request
+
+          target = Path(os.environ['RUNNER_TEMP']) / 'gnark-proxy-validation'
+          target.mkdir()
+          lock = tomllib.loads(Path('Cargo.lock').read_text())
+          matches = [p for p in lock['package'] if p['name'] == 'sp1-recursion-gnark-ffi']
+          assert len(matches) == 1
+          package = matches[0]
+          assert package['version'] == '6.4.0'
+          assert package['source'] == 'registry+https://github.com/rust-lang/crates.io-index'
+          assert package['checksum'] == 'e470a218ab7e27fa039ce550e355855a0bad071b563403c2b87696150c2f218e'
+          stem = f"{package['name']}-{package['version']}"
+          url = f"https://static.crates.io/crates/{package['name']}/{stem}.crate"
+          with urllib.request.urlopen(url, timeout=90) as response:
+              archive = response.read()
+          assert hashlib.sha256(archive).hexdigest() == package['checksum']
+          with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as source:
+              source.extractall(target, filter='data')
+          crate = target / stem
+          for name in ('go.mod', 'go.sum'):
+              source_file = crate / 'go' / name
+              (target / f'{name}.sha256').write_text(hashlib.sha256(source_file.read_bytes()).hexdigest())
+          build = (crate / 'build.rs').read_text()
+          assert '"-tags=debug"' in build and '"-buildmode=c-archive"' in build
+          config = tomllib.loads(Path('.cargo/config.toml').read_text())
+          proxy = config['env']['GOPROXY']
+          assert proxy == 'https://proxy.golang.org,https://goproxy.cn,direct'
+          assert 'GOPROXY' not in os.environ, 'Probe needs Cargo to supply GOPROXY'
+          probe = target / 'probe'
+          (probe / 'src').mkdir(parents=True)
+          (probe / 'Cargo.toml').write_text('[package]\nname = "gnark-proxy-probe"\nversion = "0.0.0"\nedition = "2021"\n')
+          (probe / 'src/main.rs').write_text('''use std::{env, path::PathBuf, process::Command};
+          fn main() {
+              let expected = env::var("EXPECTED_GOPROXY").unwrap();
+              assert_eq!(env::var("GOPROXY").unwrap(), expected);
+              println!("Cargo supplied GOPROXY={expected}");
+              let dir = PathBuf::from(env::var("GNARK_GO_DIR").unwrap());
+              let output = PathBuf::from(env::var("GNARK_ARTIFACT").unwrap());
+              for args in [
+                  vec!["version"],
+                  vec!["env", "GOPROXY", "GOSUMDB", "GONOSUMDB", "GOPRIVATE"],
+                  vec!["mod", "download", "-json", "github.com/consensys/gnark-ignition-verifier@v0.0.0-20230527014722-10693546ab33"],
+                  vec!["build", "-tags=debug", "-o", output.to_str().unwrap(), "-buildmode=c-archive", "."],
+                  vec!["mod", "verify"],
+              ] {
+                  println!("Running go {}", args.join(" "));
+                  assert!(Command::new("go").current_dir(&dir).env("CGO_ENABLED", "1").args(&args).status().unwrap().success(), "Go command failed");
+              }
+              assert!(output.metadata().unwrap().len() > 0);
+              assert!(output.with_extension("h").is_file());
+          }
+          ''')
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              print(f'EXPECTED_GOPROXY={proxy}', file=out)
+              print(f'GNARK_GO_DIR={crate / "go"}', file=out)
+              print(f'GNARK_ARTIFACT={target / "libsp1gnark.a"}', file=out)
+              print(f'GNARK_PROBE_MANIFEST={probe / "Cargo.toml"}', file=out)
+          print(f'Verified published {stem} against Cargo.lock SHA256 {package["checksum"]}')
+          PY
+
+      - name: Build real Go archive using Cargo-provided proxy configuration
+        shell: bash
+        run: |
+          test -z "${GOPROXY+x}"
+          test -z "$(go env GONOSUMDB)"
+          test -z "$(go env GOPRIVATE)"
+          test "$(go env GOSUMDB)" = sum.golang.org
+          # Use the hosted runner's installed stable toolchain only for this std-only
+          # probe. Running Cargo from the checkout exercises its .cargo/config.toml.
+          # No Base Rust dependencies, release builds, caches, or secrets are used.
+          cargo +stable run --offline --manifest-path "$GNARK_PROBE_MANIFEST"
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          target = Path(os.environ['RUNNER_TEMP']) / 'gnark-proxy-validation'
+          for name in ('go.mod', 'go.sum'):
+              source_file = Path(os.environ['GNARK_GO_DIR']) / name
+              assert hashlib.sha256(source_file.read_bytes()).hexdigest() == (target / f'{name}.sha256').read_text()
+          print('Published go.mod and go.sum unchanged')
+          PY
+          printf 'Exact PR head d460e82562a69561f3acf6bbad35d2a89601659e: Cargo supplied GOPROXY; checksum-verified SP1 6.4.0 Go c-archive compiled; go mod verify passed.\n' >> "$GITHUB_STEP_SUMMARY"
