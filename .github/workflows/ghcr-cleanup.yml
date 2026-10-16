@@ -21,6 +21,8 @@ permissions:
 
 jobs:
   cleanup:
+    # These release packages belong to upstream, not contribution forks.
+    if: github.repository == 'base/base'
     name: Delete images older than 60 days
     runs-on: ubuntu-latest
     steps:
